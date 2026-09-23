@@ -220,5 +220,7 @@
   "hooks.useNativeNotification.new_notifications",
   "pages.contextBreakdown.scope_turns",
   "pages.contextBreakdown.earlier_hidden",
-  "pages.contextBreakdown.scope_all_turns"
+  "pages.contextBreakdown.scope_all_turns",
+  "pages.overview.memoryTab.skipped_incognito_session",
+  "pages.overview.memoryTab.skipped_temporary_session"
 ]

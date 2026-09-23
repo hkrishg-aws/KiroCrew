@@ -103,7 +103,12 @@ header, Slack (`!incognito` / `!temporary` prefix), or Telegram (`/incognito` /
 `/temporary`). Telegram spells them as commands because it has a command grammar;
 the modes, the guarantees and the durability are the same on both channels, and
 both accept a question after the modifier to mark the conversation and answer in
-one message.
+one message. The gateway keeps one small record per private conversation and
+retains at most 10,000 of them; if that limit is ever reached, a modifier on a
+conversation that is not yet private is refused with a message saying so, and the
+message it was attached to is NOT processed -- it is never run with the mode
+silently dropped, and no existing private conversation is forgotten to make room.
+Conversations already private keep their mode and can still be tightened.
 
 Persistent sessions retain history for resume. Incognito and Temporary keep new
 conversation bodies in memory and do not write transcript, workflow or task
@@ -169,7 +174,21 @@ Kiro Crew automatically consolidates conversations into memory:
 - **Preferences/projects**: every 30 messages per session
 - **Daily history + lessons**: after 3 hours idle per session
 
-No manual action needed — it happens in the background.
+No manual action needed — it happens in the background. The manual trigger
+(Overview → Memory tab → Summarize now, or `POST /api/memory/consolidate`) refuses
+an Incognito or Temporary session with a 403 no matter which session triggers it,
+and the background paths skip those sessions — including a Slack or Telegram
+thread marked `!incognito` / `!temporary`, whose mode is recorded in the thread's
+own transcript header so it holds across restarts — so the mode table above holds
+for every route. The Memory tab's tally reports those refusals as skipped, not
+failed, and names the mode when every skipped session shares one ("1 skipped:
+incognito session"); a failed count means a request genuinely failed, and the
+notice lists the sessions it failed for (by title, with the session key beside
+it) until you dismiss it, with a "Retry N failed" button that re-runs those
+sessions only. If the session list itself cannot be loaded, the tab says so as a
+failure (with the server's message) rather than reporting nothing to summarize.
+The line under the button says what it does: it writes summaries into memory
+and leaves your conversations untouched.
 
 ## Reading Memory Programmatically
 

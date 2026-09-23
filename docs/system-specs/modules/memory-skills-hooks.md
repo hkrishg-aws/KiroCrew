@@ -326,7 +326,11 @@ Storage failure rolls back the whole pass. Verified corrections compare their
 pre-extraction record revision in that transaction. Embeddings are deferred for
 maintenance and cannot hold the write lock during provider inference. Before a
 retry calls a provider, a committed receipt recovers a lost transcript progress
-acknowledgement and leaves later appended messages pending.
+acknowledgement and leaves later appended messages pending. The optional `admit`
+hook is called before each mutation and once more before the commit; the
+consolidator hands in its write gate's per-mutation check (in-memory records
+only, so the transaction still performs no provider, transcript or filesystem
+operation), and a raise there rolls the transaction back whole.
 
 The following file-oriented flow and independent writes describe V1.
 
@@ -388,7 +392,144 @@ Idle detection: `_last_activity[key]` updated on every `maybe_consolidate()` cal
 
 **Both paths write to the session's captured store.** `_consolidate` captures the
 canonical execution context before its first await and refuses incognito or
-temporary sessions before reading their transcripts. V2 uses that context's exact
+temporary sessions before reading their transcripts. The durable records are read
+by ONE resolver, `resolve_consolidation_target` (module-level in
+`history_consolidation.py`), which the dashboard's `POST /api/memory/consolidate`
+asks as well, so a source known to one caller is known to the other by
+construction (a route test pins this by substitution: a verdict from a source the
+route has never heard of still refuses at the route). Three sources, and their
+ORDER is a privacy contract -- a mode already known without opening the transcript
+refuses first, and only an unknown one reads the header: the execution record;
+then, for a channel thread, the session map's `temporary` / `incognito` flag
+(`SessionMap.set_flag`, keyed by the live `slack:<ts>` key), read through the
+consolidator's `SessionManager` the way the dashboard reads it
+(`privacy_mode.hydrate` + the trackers) after unfolding a transcript stem to its
+live key (`channel_thread_mode`; the unfold is a walk over the map under its lock
+and runs only for a key that can BE a stem -- a key still carrying `:`, or a
+legacy bare Slack ts, is never one, so the write gate's per-mutation tier does
+not pay the walk); last, the transcript header's `memory_mode`,
+read normalized (`history.transcript_privacy_mode`: the shared predicate's
+`lower()` and set, returning the mode, so a header spelled `Temporary` refuses
+AS `temporary` and that is the mode the SEL record, the memo, the route's 403
+body and the tab's tally carry),
+which `privacy_mode.apply_mode` stamps for a channel thread (tighten-only, upserted
+so a thread flagged before its first turn gets a metadata-only header that
+`ConversationLog.append` then keeps) so a transcript read never depends on the
+session map -- and, because that header read is an await while the modifier
+writes its flag synchronously and its header afterwards, the map flag is read
+once more after the header read, before an unrestricted verdict: a modifier
+landing during the read is caught by that second dict lookup, whose restricted
+answer wins (the execution record is not re-read; a slot's mode is fixed at
+creation). A restricted session whose mode is known is thus refused without the
+resolver or the pass behind it opening its transcript, not even for the header
+(`test_restricted_consolidation_never_reads_transcript_or_opens_memory`); the
+scope is the pass -- `consolidate_session` (the session-end hooks) and the CLI's
+`consolidate_now` read the transcript for their own pre-checks (unconsolidated
+count, sensitive-session scan) before scheduling it, and write nothing. The two
+records serve two readers -- the map flag is what the channel's inbound gate
+hydrates from per message, the header is what every memory reader refuses on --
+and a privacy flag keeps its map entry alive through `SessionMap.prune` and the
+per-read repair, both of which run under the map lock on the event loop and read
+no transcript, and through every other path: no step removes a privacy-flagged
+row, whatever the header says, because the gate hydrates from the map alone and
+a removed row leaves it reading the thread as persistent after the next restart.
+The header is ensured by `SessionMap.stamp_privacy_headers`, which the session
+pool's `start_pool` runs right after `prune` (awaited in place by a blocking
+start; inside the already-scheduled task by a non-blocking one, so a live-config
+apply or a background-session restart never waits on it): every flagged row is named under
+the lock, and on a worker thread its existing transcript's header gets the mode
+copied in where it is missing or weaker (tighten-only, never creating a
+transcript); a flag tightened during the probe is re-stamped by the next pass,
+and a header that already records the mode costs no write (`needs_tightening`).
+The rows are capped at `SessionMap.PRIVACY_ROW_CAP` (the trackers' `PRIVACY_LRU_MAX`),
+held by refusing a NEW flag fail-closed -- the modifier tells the user the
+message was not processed and does not run it -- never by evicting a retained
+row. Retiring those rows needs the gate to read the header, a separate change. Every
+refusal goes
+through `_refuse_restricted`: a debug line naming the source, and the SEL denial
+the dashboard route records for the same target (`memory.consolidate` /
+`denied` / `restricted_target_session:<mode>:<key>`, `source="background"`,
+`caller="history_consolidator"`), one record per refusal -- nothing is windowed,
+counted or folded, because an audit event that is sometimes not written is a
+gap the reader cannot see. The volume is solved where it arises: a refused key
+is memoed in `_restricted_refused` (bounded by `_RESTRICTED_REFUSAL_MEMO_MAX`,
+oldest evicted with a debug line; an evicted key costs one more refused attempt
+and one more SEL row before it is memoed anew), and the two automatic entry points
+(`check_idle_sessions`, `maybe_consolidate`) skip a memoed key before any read
+or task, so the idle sweep attempts a restricted session once per process
+rather than once per 60 s tick; the explicit triggers (`consolidate_session`,
+`consolidate_now`, the dashboard route) ignore the memo, so a Summarize-now
+aimed at the session is attempted and audited every time. Only a COMMITTED
+restriction is memoed: a mode standing provisionally
+(`privacy_mode.is_provisional` on the live channel key -- a Telegram reservation
+whose steer has not landed, a commit or a release in flight) is refused and
+audited but not remembered, because a reservation the steer's failure then
+releases would otherwise leave the now-persistent session skipped by every
+automatic sweep for the life of the process. The mode is resolved
+once before the pass's snapshot, and from there the re-check lives IN the write
+path rather than at each write site: every durable write of the pass is a verb
+of `_WriteGate` (`set_semantic`, `propose_semantic_delete`, `delete_semantic`,
+`write_episodic`, `write_lesson`, the lesson file's `save`, `append_history`,
+`write_preferences`, `write_projects`, `stage_skill_candidate`,
+`create_auto_skill`, `update_auto_skill`, `mark_consolidated`,
+`apply_consolidation` -- each the store's own verb, admitting NOTHING itself),
+and every batch of them is dispatched through the gate (`run` on the embed pool,
+`run_in_thread` on a worker). Two tiers by cost: `admit`, before EVERY mutation
+on whatever thread performs it, reads the in-memory records only
+(`restricted_in_memory`: the live execution registry, a channel thread's
+trackers and map flag -- `privacy_mode.recorded_mode`, the read-only form of
+the hydrate that marks nothing from a worker -- dict lookups, no file read);
+`boundary`, before every dispatch, runs the full resolution with the
+transcript header, off the loop -- and once more directly ahead of the skill
+pass, which hands the FULL transcript to a model: a transcript that just turned
+private is not disclosed to it either, durable write or not. An admission is a
+point-in-time verdict, not a token: no TTL, no counter, no lease, it holds for
+the statement that follows it and for nothing after. Taken at the verb it
+cannot hold, because between the verb and the write the store waits on its own
+lock (the history file's `.append.lock`, the database's `_db_lock`, the
+lesson file's lock, the transcript lock) or embeds for seconds, and a mode that
+lands in that wait lets the write follow the restriction. So every verb hands
+`admit` INTO the store as the method's `admit` hook, and the store asks it as
+the LAST step inside its own critical section -- after the lock is granted,
+after every read and embedding, immediately before the mutation with nothing
+between them, and again before the commit where it owns a transaction -- so
+there is exactly one admission site per mutation and it sits where the
+mutation is decided. A raise there unwinds through the store's own rollback or
+leaves its file untouched: the store is byte-identical. The V1 episodic cap
+eviction is one of those mutations: `write_episodic` makes room
+(`_evict_for_episodic_cap`) INSIDE that transaction, after the admission and
+before the insert, so a refused row unwinds the tombstones with it -- evicted
+ahead of the transaction, an existing episode was gone for a row that never
+landed. A member (V2) store publishes a span in one transaction, whose
+`admit` hook is called before each mutation and once more before the commit,
+so nothing partial commits. Either tier
+raises `_ModeTightened`, which unwinds the batch or transaction in flight up to
+`_consolidate`, the one place it is caught: the pass ends with the same SEL
+denial and memo entry as a verdict before the snapshot, no retry attempt
+charged. So a modifier landing while a pass is in flight -- during the model
+call, inside an earlier write of the same pass, between two rows of one batch,
+inside the member transaction, between a created skill and its refinement --
+stops the next write, and the offset does not advance; every modifier path
+writes a record one of the tiers reads (the channel modifier's tracker and map
+flag before its awaited header write; a dashboard or API slot's mode is fixed at
+creation in its execution record). A switch that lands after a write completed
+is not retroactive -- nothing purges, the existing design line. The invariant is
+pinned structurally rather than by a list of sites
+(`test/test_consolidation_write_gate.py`, over the module's syntax tree): the
+gate's verbs are the inventory, no verb is called or handed to an executor
+anywhere else, every verb hands `admit` into its store method and admits nothing
+itself, every store method those verbs front (read off `vector_memory.py`,
+`memory.py`, `learn.py`, `skills.py`, `history.py`) asks the hook inside the
+lock block its mutation sits in and ahead of that mutation on its own branch,
+both dispatchers resolve first, the
+batch helpers (`_write_structured_memory`, `_save_lessons`,
+`_process_auto_skills`) are dispatched only through the gate and take it with no
+default, and outside the gate a store is only ever read (an allowlist of reads,
+each with its reason; the one write reached outside is the abandon marker,
+transcript bookkeeping for a span that was never extracted). This is the memory-mode
+choke point every entry point inherits (idle sweep, `maybe_consolidate`, expiry
+sweep, dashboard trigger, CLI); the dashboard trigger adds its own target-side 403
+in front of it (see the route table below). V2 uses that context's exact
 member store and commits learned records, history and the retry receipt in one
 SQLite transaction. V1 retains `context.store_of_session(log, key)` and its
 Markdown and lesson fallback behavior. See [Memory across surfaces and channels](#memory-across-surfaces-and-channels).
@@ -808,7 +949,7 @@ silently: were detection ever bypassed on a crew file, v1's
 **Timestamps are TEXT ISO-8601, never the `REAL` a numeric schema would reach for.**
 Seven sites rank `created_at` / `updated_at` by lexicographic string comparison and two
 more parse them with `datetime.fromisoformat`; one of the seven is
-`_enforce_episodic_cap`, the episodic CAP EVICTION, where a wrong order tombstones the
+`_evict_for_episodic_cap`, the episodic CAP EVICTION, where a wrong order tombstones the
 wrong memories. SQLite also sorts REAL before TEXT, so a mixed column is worse than
 either choice on its own.
 
@@ -2305,7 +2446,7 @@ before reading transcript bodies, opening learned memory or billing a model.
 | POST | `/api/memory/migrate` | Migrate markdown → structured memory (gated) |
 | POST | `/api/memory/import` | Import from JSON export (gated) |
 | POST | `/api/memory/promote` | Promote repeated episodic patterns to semantic facts, tombstoning the rows folded in (gated) |
-| POST | `/api/memory/consolidate` | Trigger consolidation for one session (restricted-mode check only) |
+| POST | `/api/memory/consolidate` | Trigger consolidation for one session. Gated on the caller like every write, and additionally on the TARGET: the body's `key` is resolved through `resolve_session_memory_mode` (live slot first, then the persisted execution record and transcript header) and a temporary or incognito target is 403 `restricted_target_session` (the body carries the target's `mode` as a field, which the Memory tab's tally names) before the running claim or any transcript read. When that live resolution does not refuse, the route asks `resolve_consolidation_target` -- the ONE resolver `_consolidate` asks too -- under the key exactly as the consolidator will read it, so whatever the background path would refuse (execution record, transcript header, session-map flag) is 403 here instead of 200 for a pass the consolidator refuses; a stem the map cannot unfold, or an entry the map no longer holds, is refused from its header like the mapped case. A key no durable record calls restricted proceeds |
 | GET | `/api/memory/context-preview?q=` | Preview injected semantic + episodic context |
 | GET | `/api/memory/observability?q=` | `stats` + `rejections` + `context_preview`, plus `reads` — the read-volume counters (see above). `reads` is resolved LAST, so it INCLUDES the reads this request itself performed; that is what lets a caller issue the same `q` twice and compare the two objects |
 | GET | `/api/memory/recall?q=` | V2 task recall with evidence. Explicit `store` requires the dashboard owner; the authenticated MCP path uses the owning session's canonical execution context and requires memory reads to be allowed. Invalid or unavailable member memory returns an explicit error |

@@ -12,6 +12,7 @@ import json
 import logging
 import stat
 import threading
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
@@ -323,7 +324,7 @@ class LessonStore:
         self._cache = None  # invalidate
 
     @named_store_operation
-    def save(self, lesson: Lesson) -> str:
+    def save(self, lesson: Lesson, *, admit: Callable[[], None] | None = None) -> str:
         """Insert *lesson*, skipping a rule that is already stored.
 
         Deliberately does NOT enrich. Most callers here are automatic --
@@ -336,10 +337,10 @@ class LessonStore:
         ``refused`` to avoid counting, notifying, or ledgering a lesson that did not
         persist; callers that ignore the return remain unaffected.
         """
-        return self._insert_or_enrich(lesson, enrich=False)
+        return self._insert_or_enrich(lesson, enrich=False, admit=admit)
 
     @named_store_operation
-    def save_or_enrich(self, lesson: Lesson) -> str:
+    def save_or_enrich(self, lesson: Lesson, *, admit: Callable[[], None] | None = None) -> str:
         """Insert *lesson*, or attach its NOT-clause to the record holding the same
         rule, in ONE lock acquisition. Returns
         ``inserted``/``enriched``/``unchanged``/``refused``.
@@ -351,9 +352,11 @@ class LessonStore:
         check, which matches on the rule alone: returning before looking at
         ``negative`` would drop the clause behind an HTTP 200.
         """
-        return self._insert_or_enrich(lesson, enrich=True)
+        return self._insert_or_enrich(lesson, enrich=True, admit=admit)
 
-    def _insert_or_enrich(self, lesson: Lesson, *, enrich: bool) -> str:
+    def _insert_or_enrich(
+        self, lesson: Lesson, *, enrich: bool, admit: Callable[[], None] | None = None
+    ) -> str:
         """Shared body for :meth:`save` and :meth:`save_or_enrich`.
 
         The single lock acquisition is the load-bearing part. Doing enrich and
@@ -471,6 +474,12 @@ class LessonStore:
                             lesson.rule,
                         )
                         return "refused"
+            # The caller's admission (the consolidator's write gate), asked under
+            # the lock immediately before the file is rewritten: a restriction
+            # that landed while this writer waited for the lock refuses the
+            # lesson with the file untouched.
+            if admit is not None:
+                admit()
             self._write_all(updated)
         logger.info("%s lesson: %s", outcome.capitalize(), lesson.rule)
         return outcome

@@ -4523,8 +4523,13 @@ class SkillsLoader:
         triggers: str,
         procedure_md: str,
         provenance: AutoSkillProvenance,
+        admit: Callable[[], None] | None = None,
     ) -> str | None:
         """Write a new auto-generated skill under ``auto/<slug>/SKILL.md``.
+
+        ``admit`` is the caller's admission check (the consolidator's write
+        gate), asked immediately before the first write -- this writer takes no
+        lock, so the write itself is the step it guards.
 
         Returns the full skill name (``auto/<slug>``) on success, or
         ``None`` if the slug is invalid or the skill already exists.
@@ -4558,6 +4563,8 @@ class SkillsLoader:
             procedure_md=procedure_md,
             provenance=provenance,
         )
+        if admit is not None:
+            admit()
         skill_dir.mkdir(parents=True, exist_ok=True)
         (skill_dir / "SKILL.md").write_text(content, encoding="utf-8")
         self._invalidate_iter_cache()  # new skill visible to trigger matching now
@@ -4572,8 +4579,12 @@ class SkillsLoader:
         triggers: str,
         procedure_md: str,
         provenance: AutoSkillProvenance,
+        admit: Callable[[], None] | None = None,
     ) -> bool:
         """Update an existing auto-generated skill with a refined procedure.
+
+        ``admit``: the caller's admission check, asked immediately before the
+        rewrite (no lock here; the write is the guarded step).
 
         Refuses to overwrite skills NOT in the auto namespace — protects
         hand-authored skills from being clobbered by the refine path.
@@ -4637,6 +4648,8 @@ class SkillsLoader:
             _carry.append("inject_on_trigger: false")
         if _carry:
             content = content.replace("\n---\n", "\n" + "\n".join(_carry) + "\n---\n", 1)
+        if admit is not None:
+            admit()
         skill_file.write_text(content, encoding="utf-8")
         self._invalidate_iter_cache()  # so the refined triggers/description apply now
         logger.info("Refined auto skill: %s", name)
@@ -4994,6 +5007,7 @@ class SkillsLoader:
         kind: str = "new",
         target: str | None = None,
         base_version: int | None = None,
+        admit: Callable[[], None] | None = None,
     ) -> str | None:
         """Write a skill candidate to the pending queue (not live).
 
@@ -5019,6 +5033,10 @@ class SkillsLoader:
             return None
         name = f"{AUTO_SKILL_NAMESPACE}/{slug}"
         root = self._pending_root()
+        # The caller's admission (the consolidator's write gate), asked ahead of
+        # the first mutation -- the pending root and the directory claim below.
+        if admit is not None:
+            admit()
         root.mkdir(parents=True, exist_ok=True)
         # Atomically CLAIM a pending dir. mkdir(exist_ok=False) closes the TOCTOU
         # between an exists() check and the create. If the natural slug is already

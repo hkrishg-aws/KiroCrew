@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -304,25 +304,31 @@ class TestApplyMode:
         await _land_on_disk(sm)
 
     @pytest.mark.asyncio
-    async def test_a_persist_failure_still_leaves_the_session_restricted(self, audits):
-        """Mutation: let ``_persist`` re-raise instead of logging — red.
+    async def test_a_row_that_cannot_be_written_refuses_and_publishes_nothing(self, audits):
+        """Mutation: mark before ``_land``, or swallow its failure -- red.
 
-        The in-memory mark already happened, so failing the modifier here would
-        tell the user privacy is off while it is on for this whole process.
+        The durable row is the record the next boot restores from; a mark with
+        no row behind it is exactly the state a restart loses. So a map that
+        cannot write the row refuses the turn: no mark, one ``denied`` record,
+        and the user told the message was NOT processed -- never told the mode
+        is on.
         """
         sm = MagicMock(spec=SessionMap)
+        sm.get_flag.return_value = False
         sm.set_flag.side_effect = OSError("read-only")
         rec = _Recorder()
-        applied = await privacy_mode.apply_mode(
-            privacy_mode.MODE_INCOGNITO,
-            _TG_KEY,
-            source="telegram",
-            sessions=_Sessions(sm),
-            notify=rec.notify,
-        )
-        assert applied is True
-        assert privacy_mode.is_restricted(_TG_KEY) is True
-        assert rec.notices == [privacy_mode.NOTICE_INCOGNITO]
+        with pytest.raises(privacy_mode.PrivacyModeRefused) as raised:
+            await privacy_mode.apply_mode(
+                privacy_mode.MODE_INCOGNITO,
+                _TG_KEY,
+                source="telegram",
+                sessions=_Sessions(sm),
+                notify=rec.notify,
+            )
+        assert raised.value.reason == privacy_mode.REFUSAL_PERSIST_FAILED
+        assert privacy_mode.is_restricted(_TG_KEY) is False
+        assert rec.notices == [privacy_mode.refusal_notice("incognito", "persist_failed")]
+        assert [e["outcome"] for e in audits] == ["denied"]
 
     @pytest.mark.asyncio
     async def test_an_auto_attribute_stub_is_not_mistaken_for_a_session_map(self, audits):
@@ -447,6 +453,254 @@ class TestRestartDurability:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# The transcript header: the record that outlives the session-map entry
+# ──────────────────────────────────────────────────────────────────────
+class TestTranscriptHeaderDurability:
+    """The modifier stamps ``memory_mode`` into the transcript header -- the field
+    ``is_incognito_transcript`` and every memory reader already refuse on -- so a
+    transcript read never depends on the session map. The header write goes
+    through the default ``ConversationLog``, so these tests read the default
+    sessions directory (pinned per test by the conftest) rather than a private
+    ``base_dir``."""
+
+    @staticmethod
+    def _log(seed: bool = True):
+        from kiro_crew import history as history_mod
+        from kiro_crew.history import ConversationLog
+
+        log = ConversationLog()
+        log.init()
+        if seed:
+            with history_mod.allow_on_loop_persist():
+                log.append(_TG_KEY, "user", "a persistent-era turn")
+        return log
+
+    @pytest.mark.asyncio
+    async def test_the_modifier_stamps_the_transcript_header(self, audits, session_map):
+        """Mutation: delete the ``_persist_transcript_mode`` call — red.
+
+        This is the header the consolidator's header source and the consolidate
+        route's header probe read.
+        """
+        log = self._log()
+        assert "memory_mode" not in log.get_metadata(_TG_KEY), "premise: header carries no mode"
+        sm = session_map()
+        await privacy_mode.apply_mode(
+            privacy_mode.MODE_INCOGNITO,
+            _TG_KEY,
+            source="telegram",
+            sessions=_Sessions(sm),
+        )
+        await _land_on_disk(sm)
+        assert log.get_metadata(_TG_KEY).get("memory_mode") == "incognito"
+        # The turn written before the modifier is still there; the header, not
+        # the body, is what changed.
+        assert [m["content"] for m in log.read_messages(_TG_KEY)] == ["a persistent-era turn"]
+
+    @pytest.mark.asyncio
+    async def test_a_transcript_that_does_not_exist_yet_gets_the_header_first(
+        self, audits, session_map
+    ):
+        """``!incognito`` as the thread's very first message.
+
+        The header is upserted, so the first row a later writer appends lands
+        under a header that already carries the mode. Mutation: switch the
+        stamp to ``require_existing=True`` — red.
+        """
+        from kiro_crew import history as history_mod
+
+        log = self._log(seed=False)
+        assert not log.has_log(_TG_KEY), "premise: no transcript yet"
+        sm = session_map()
+        await privacy_mode.apply_mode(
+            privacy_mode.MODE_TEMPORARY,
+            _TG_KEY,
+            source="telegram",
+            sessions=_Sessions(sm),
+        )
+        await _land_on_disk(sm)
+        assert log.get_metadata(_TG_KEY).get("memory_mode") == "temporary"
+        with history_mod.allow_on_loop_persist():
+            log.append(_TG_KEY, "user", "a later turn")
+        assert log.get_metadata(_TG_KEY).get("memory_mode") == "temporary"
+        assert [m["content"] for m in log.read_messages(_TG_KEY)] == ["a later turn"]
+
+    @pytest.mark.asyncio
+    async def test_the_header_is_only_ever_tightened(self, audits, session_map):
+        """``!incognito`` typed after ``!temporary`` must not re-enable reads.
+
+        Mutation: drop the guard (write the mode unconditionally) — red.
+        """
+        log = self._log()
+        sm = session_map()
+        await privacy_mode.apply_mode(
+            privacy_mode.MODE_TEMPORARY,
+            _TG_KEY,
+            source="telegram",
+            sessions=_Sessions(sm),
+        )
+        await privacy_mode.apply_mode(
+            privacy_mode.MODE_INCOGNITO,
+            _TG_KEY,
+            source="telegram",
+            sessions=_Sessions(sm),
+        )
+        await _land_on_disk(sm)
+        assert log.get_metadata(_TG_KEY).get("memory_mode") == "temporary"
+
+    @pytest.mark.asyncio
+    async def test_a_header_spelled_temporary_in_mixed_case_is_not_loosened(
+        self, audits, session_map
+    ):
+        """``Temporary`` in the header, then ``!incognito``: the header keeps the
+        stricter mode it spells.
+
+        A header is not bound by the API's validation. Compared raw, ``Temporary``
+        is unknown to ``strictest`` -- weaker than any mode -- so the incognito
+        stamp would overwrite it and every memory reader would then see a looser
+        mode than the one written. The compare normalizes first
+        (``transcript_privacy_mode``, the same rule ``is_incognito_transcript``
+        applies). Mutation: compare the raw string -- the header reads
+        ``incognito``.
+        """
+        from kiro_crew import history as history_mod
+        from kiro_crew.history import transcript_privacy_mode
+
+        log = self._log()
+        with history_mod.allow_on_loop_persist():
+            log.update_metadata(_TG_KEY, {"memory_mode": "Temporary"})
+        sm = session_map()
+        await privacy_mode.apply_mode(
+            privacy_mode.MODE_INCOGNITO,
+            _TG_KEY,
+            source="telegram",
+            sessions=_Sessions(sm),
+        )
+        await _land_on_disk(sm)
+        header = log.get_metadata(_TG_KEY).get("memory_mode")
+        assert header == "Temporary", "the incognito stamp overwrote a stricter header"
+        assert transcript_privacy_mode(header) == "temporary"
+
+    @pytest.mark.asyncio
+    async def test_a_header_write_failure_refuses_and_publishes_nothing(
+        self, audits, session_map, monkeypatch
+    ):
+        """Mutation: swallow the header write's failure in ``_persist_transcript_mode``
+        and stamp it after the mark (the r26 shape) -- red: ``DID NOT RAISE
+        PrivacyModeRefused`` (the message ran, marked and announced, under a mode
+        the header did not carry).
+
+        The header is the record the out-of-process gates read:
+        ``capture_session_execution`` takes an absent ``memory_mode`` as
+        ``persistent`` and MCP ``register_hook`` decides on it. So its write is
+        the second half of the durable step, not a best-effort tail: when it
+        fails the row is taken back, nothing is marked, and the user is told the
+        message was NOT processed. Patched on the class, because the module
+        builds its own ``ConversationLog``.
+        """
+        from kiro_crew.history import ConversationLog
+
+        self._log()
+        monkeypatch.setattr(
+            ConversationLog, "update_metadata_if", MagicMock(side_effect=OSError("read-only"))
+        )
+        sm = session_map()
+        rec = _Recorder()
+        with pytest.raises(privacy_mode.PrivacyModeRefused) as refused:
+            await privacy_mode.apply_mode(
+                privacy_mode.MODE_INCOGNITO,
+                _TG_KEY,
+                source="telegram",
+                sessions=_Sessions(sm),
+                notify=rec.notify,
+            )
+        await _land_on_disk(sm)
+        assert refused.value.reason == privacy_mode.REFUSAL_PERSIST_FAILED
+        trail = [e["outcome"] for e in audits]
+        assert privacy_mode.is_restricted(_TG_KEY) is False and trail == ["denied"], (
+            "the failed header write published the mode: "
+            f"marked={privacy_mode.is_restricted(_TG_KEY)}, trail={trail}"
+        )
+        assert sm.get_flag(_TG_KEY, "incognito") is False, "the row was not taken back"
+        assert sm.privacy_flagged_entries() == {}
+        assert privacy_mode._pending == {}
+        assert len(rec.notices) == 1 and "NOT processed" in rec.notices[0]
+        assert audits[0]["resources"].startswith(
+            f"private_session_refused:{privacy_mode.REFUSAL_PERSIST_FAILED}:"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_cancellation_during_the_header_write_publishes_nothing_and_keeps_the_records(
+        self, audits, session_map, monkeypatch
+    ):
+        """The header write is now the last await of the DURABLE step, ahead of the
+        mark and the record. A gateway shutdown that cancels the modifier's task
+        while it is in flight therefore publishes nothing in this process -- no
+        mark, no ``allowed`` record, no notice -- while both durable records
+        stand: the row landed before the write, and the write itself runs on its
+        worker thread to completion (a cancellation lands on the awaiting task,
+        never on the thread), so the header carries the mode too. The next
+        inbound message hydrates the mark from the row. Mutation: mark and
+        record before the header write (the r26 order) -- red
+        (``['allowed'] == []``): a mode is announced whose header write has not
+        happened.
+        """
+        from kiro_crew.history import ConversationLog, transcript_privacy_mode
+
+        log = self._log()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        real_update = ConversationLog.update_metadata_if
+
+        def _blocked_write(self_log, *args, **kwargs):
+            # Runs on the worker thread ``asyncio.to_thread`` hands it to; the
+            # cancellation lands on the awaiting task, not on this thread, which
+            # completes the write once released.
+            loop.call_soon_threadsafe(entered.set)
+            asyncio.run_coroutine_threadsafe(release.wait(), loop).result(timeout=5)
+            return real_update(self_log, *args, **kwargs)
+
+        loop = asyncio.get_running_loop()
+        monkeypatch.setattr(ConversationLog, "update_metadata_if", _blocked_write)
+        sm = session_map()
+        rec = _Recorder()
+        task = asyncio.ensure_future(
+            privacy_mode.apply_mode(
+                privacy_mode.MODE_INCOGNITO,
+                _TG_KEY,
+                source="telegram",
+                sessions=_Sessions(sm),
+                notify=rec.notify,
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert privacy_mode.is_restricted(_TG_KEY) is False, "published under a cancelled write"
+        assert [(e["operation"], e["outcome"]) for e in audits] == []
+        assert rec.notices == []
+        release.set()
+        for _ in range(200):  # the thread finishes the write it was handed
+            await asyncio.sleep(0.005)
+            if transcript_privacy_mode(log.get_metadata(_TG_KEY).get("memory_mode")) == "incognito":
+                break
+        assert transcript_privacy_mode(log.get_metadata(_TG_KEY).get("memory_mode")) == "incognito"
+        assert sm.get_flag(_TG_KEY, "incognito") is True, "the row landed before the write"
+        assert privacy_mode._pending == {}
+        privacy_mode.hydrate(_Sessions(sm), _TG_KEY)
+        assert privacy_mode.is_restricted(_TG_KEY) is True, "the next hydrate restores the mark"
+
+    @pytest.mark.asyncio
+    async def test_without_sessions_no_header_is_written(self, audits):
+        """In-memory only means neither record: no map flag, no header."""
+        log = self._log()
+        await privacy_mode.apply_mode(privacy_mode.MODE_INCOGNITO, _TG_KEY, source="telegram")
+        assert "memory_mode" not in log.get_metadata(_TG_KEY)
+        assert privacy_mode.is_incognito(_TG_KEY) is True
+
+
+# ──────────────────────────────────────────────────────────────────────
 # The dashboard gates the ~30 memory mutations sit behind
 # ──────────────────────────────────────────────────────────────────────
 class TestDashboardGateReach:
@@ -554,3 +808,998 @@ class TestStrictest:
         declared = {mode for mode, _pattern in privacy_mode._MODES}
         assert declared - ranked == set(), "these modes have no strictness rank"
         assert ranked - declared == set(), "these ranks name a mode that no longer exists"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# The private-conversation cap: refuse, never evict
+# ──────────────────────────────────────────────────────────────────────
+class TestPrivateConversationCap:
+    """The map retains at most ``PRIVACY_ROW_CAP`` privacy rows; the bound is held
+    by REFUSING the next new flag, fail-closed, never by evicting a row.
+
+    A row is the record the channel gate hydrates from, so evicting one would
+    run that thread as persistent -- the leak the flag closes. Refusing means:
+    no row, no in-memory mark, one SEL ``denied`` record, the user told that the
+    message was NOT processed, and ``apply_mode`` raising so the caller cannot
+    run the turn with the mode silently dropped. Existing rows keep hydrating
+    restricted. Mutation: drop the gate in ``SessionMap.set_flag`` -- the flag is
+    written and the modifier applies.
+    """
+
+    @staticmethod
+    def _fill(sm: SessionMap, count: int) -> list[str]:
+        keys = [f"telegram:kirocrew:direct:{n}" for n in range(count)]
+        for key in keys:
+            sm.set_flag(key, privacy_mode.MODE_INCOGNITO, True)
+        return keys
+
+    @pytest.mark.asyncio
+    async def test_a_new_flag_past_the_cap_is_refused_and_nothing_is_written(
+        self, audits, session_map, monkeypatch
+    ):
+        import kiro_crew.session_map as session_map_mod
+
+        monkeypatch.setattr(session_map_mod, "PRIVACY_ROW_CAP", 3)
+        sm = session_map()
+        retained = self._fill(sm, 3)
+        rec = _Recorder()
+        with pytest.raises(privacy_mode.PrivacyModeRefused) as raised:
+            await privacy_mode.apply_mode(
+                privacy_mode.MODE_INCOGNITO,
+                _TG_KEY,
+                source="telegram",
+                caller="4242",
+                sessions=_Sessions(sm),
+                notify=rec.notify,
+                on_applied=rec.on_applied,
+            )
+        assert (raised.value.mode, raised.value.session_key, raised.value.reason) == (
+            "incognito",
+            _TG_KEY,
+            privacy_mode.REFUSAL_LIMIT,
+        )
+        # Nothing written, nothing marked, no hook.
+        assert sm.get_flag(_TG_KEY, "incognito") is False
+        assert _TG_KEY not in sm._data
+        assert privacy_mode.is_incognito(_TG_KEY) is False
+        assert rec.hooks == []
+        # Told, in words that say the message did not run.
+        assert rec.notices == [privacy_mode.refusal_notice("incognito", "limit")]
+        assert "NOT processed" in rec.notices[0] and "3 conversations" in rec.notices[0]
+        # One denial, the denied twin of the allowed record.
+        assert audits == [
+            {
+                "caller": "4242",
+                "operation": "telegram.incognito_mode",
+                "outcome": "denied",
+                "source": "telegram",
+                "resources": f"private_session_refused:limit:{_TG_KEY}",
+            }
+        ]
+        # Existing rows are untouched and still hydrate restricted after a restart.
+        await _land_on_disk(sm)
+        privacy_mode.reset()
+        fresh = session_map()
+        for key in retained:
+            privacy_mode.hydrate(_Sessions(fresh), key)
+            assert privacy_mode.is_incognito(key) is True
+        assert fresh.privacy_flagged_entries() == {key: ["incognito"] for key in retained}
+
+    @pytest.mark.asyncio
+    async def test_tightening_a_retained_row_at_the_cap_is_not_refused(
+        self, audits, session_map, monkeypatch
+    ):
+        """``!temporary`` on a thread already incognito adds no row: admitted."""
+        import kiro_crew.session_map as session_map_mod
+
+        monkeypatch.setattr(session_map_mod, "PRIVACY_ROW_CAP", 3)
+        sm = session_map()
+        retained = self._fill(sm, 3)
+        rec = _Recorder()
+        applied = await privacy_mode.apply_mode(
+            privacy_mode.MODE_TEMPORARY,
+            retained[0],
+            source="telegram",
+            sessions=_Sessions(sm),
+            notify=rec.notify,
+        )
+        assert applied is True
+        assert sm.privacy_flagged_entries()[retained[0]] == ["temporary", "incognito"]
+        assert rec.notices == [privacy_mode.NOTICE_TEMPORARY]
+        assert [e["outcome"] for e in audits] == ["allowed"]
+
+    @pytest.mark.asyncio
+    async def test_an_over_long_key_is_refused_at_the_same_gate(self, audits, session_map):
+        import kiro_crew.session_map as session_map_mod
+
+        sm = session_map()
+        key = "telegram:kirocrew:direct:" + "9" * session_map_mod.PRIVACY_ROW_KEY_MAX
+        rec = _Recorder()
+        with pytest.raises(privacy_mode.PrivacyModeRefused) as raised:
+            await privacy_mode.apply_mode(
+                privacy_mode.MODE_TEMPORARY,
+                key,
+                source="telegram",
+                sessions=_Sessions(sm),
+                notify=rec.notify,
+            )
+        assert raised.value.reason == privacy_mode.REFUSAL_KEY_TOO_LONG
+        assert key not in sm._data
+        assert privacy_mode.is_temporary(key) is False
+        assert rec.notices == [privacy_mode.refusal_notice("temporary", "key_too_long")]
+        assert "NOT processed" in rec.notices[0]
+        assert [e["outcome"] for e in audits] == ["denied"]
+        assert audits[0]["resources"].startswith("private_session_refused:key_too_long:")
+
+    @pytest.mark.asyncio
+    async def test_a_row_that_cannot_be_written_refuses_with_a_real_map(
+        self, audits, session_map, monkeypatch
+    ):
+        """Every application requires the row -- the modifier on a message no less
+        than the reservation ahead of a steer. A real map whose ``set_flag`` fails
+        is a refusal (``persist_failed``): no mark, one denial, the user told.
+        Mutation: catch the write failure and mark anyway -- the mode applies with
+        no row."""
+        sm = session_map()
+        monkeypatch.setattr(sm, "set_flag", MagicMock(side_effect=OSError("disk full")))
+        rec = _Recorder()
+        with pytest.raises(privacy_mode.PrivacyModeRefused) as raised:
+            await privacy_mode.apply_mode(
+                privacy_mode.MODE_INCOGNITO,
+                _TG_KEY,
+                source="telegram",
+                caller="4242",
+                sessions=_Sessions(sm),
+                notify=rec.notify,
+            )
+        assert raised.value.reason == privacy_mode.REFUSAL_PERSIST_FAILED
+        assert privacy_mode.is_incognito(_TG_KEY) is False
+        assert rec.notices == [privacy_mode.refusal_notice("incognito", "persist_failed")]
+        assert "NOT processed" in rec.notices[0]
+        assert [e["outcome"] for e in audits] == ["denied"]
+        assert audits[0]["resources"] == f"private_session_refused:persist_failed:{_TG_KEY}"
+        assert privacy_mode._pending == {}, "a refused (mode, key) must not stay held"
+
+    def test_the_cap_is_the_trackers_bound(self):
+        import kiro_crew.session_map as session_map_mod
+
+        assert session_map_mod.PRIVACY_ROW_CAP == privacy_mode.PRIVACY_LRU_MAX == 10_000
+
+
+class TestReservations:
+    """``reserve`` applies strictly ahead of an irreversible step; ``commit`` keeps
+    it, ``release`` takes it back -- and only what the reservation itself applied,
+    only when no other holder is pending or committed."""
+
+    @staticmethod
+    def _seed_header():
+        from kiro_crew import history as history_mod
+        from kiro_crew.history import ConversationLog
+
+        log = ConversationLog()
+        log.init()
+        with history_mod.allow_on_loop_persist():
+            log.append(_TG_KEY, "user", "a persistent-era turn")
+        return log
+
+    @pytest.mark.asyncio
+    async def test_release_takes_back_row_mark_and_header_and_audits_it(self, audits, session_map):
+        log = self._seed_header()
+        sm = session_map()
+        res = await privacy_mode.reserve(
+            privacy_mode.MODE_INCOGNITO, _TG_KEY, source="telegram", sessions=_Sessions(sm)
+        )
+        await _land_on_disk(sm)
+        assert privacy_mode.is_incognito(_TG_KEY) and sm.get_flag(_TG_KEY, "incognito") is True
+        assert log.get_metadata(_TG_KEY).get("memory_mode") == "incognito"
+        await privacy_mode.release(res, sessions=_Sessions(sm), source="telegram")
+        await _land_on_disk(sm)
+        assert not privacy_mode.is_incognito(_TG_KEY)
+        assert sm.get_flag(_TG_KEY, "incognito") is False
+        assert sm.privacy_flagged_entries() == {}, "the row must stop counting against the cap"
+        assert log.get_metadata(_TG_KEY).get("memory_mode") == "persistent"
+        assert [e["outcome"] for e in audits] == ["allowed", "released"]
+
+    @pytest.mark.asyncio
+    async def test_release_restores_the_weaker_mode_the_header_held_before(
+        self, audits, session_map
+    ):
+        """``incognito`` then a reserved ``temporary`` that fails: the header goes
+        back to ``incognito``, the incognito flag and mark stay."""
+        log = self._seed_header()
+        sm = session_map()
+        await privacy_mode.apply_mode(
+            privacy_mode.MODE_INCOGNITO, _TG_KEY, source="telegram", sessions=_Sessions(sm)
+        )
+        res = await privacy_mode.reserve(
+            privacy_mode.MODE_TEMPORARY, _TG_KEY, source="telegram", sessions=_Sessions(sm)
+        )
+        assert log.get_metadata(_TG_KEY).get("memory_mode") == "temporary"
+        await privacy_mode.release(res, sessions=_Sessions(sm), source="telegram")
+        await _land_on_disk(sm)
+        assert log.get_metadata(_TG_KEY).get("memory_mode") == "incognito"
+        assert privacy_mode.is_incognito(_TG_KEY) and not privacy_mode.is_temporary(_TG_KEY)
+        assert sm.privacy_flagged_entries() == {_TG_KEY: ["incognito"]}
+
+    @pytest.mark.asyncio
+    async def test_a_session_already_in_the_mode_is_left_alone_by_a_release(
+        self, audits, session_map
+    ):
+        self._seed_header()
+        sm = session_map()
+        await privacy_mode.apply_mode(
+            privacy_mode.MODE_INCOGNITO, _TG_KEY, source="telegram", sessions=_Sessions(sm)
+        )
+        res = await privacy_mode.reserve(
+            privacy_mode.MODE_INCOGNITO, _TG_KEY, source="telegram", sessions=_Sessions(sm)
+        )
+        await privacy_mode.release(res, sessions=_Sessions(sm), source="telegram")
+        assert privacy_mode.is_incognito(_TG_KEY) and sm.get_flag(_TG_KEY, "incognito") is True
+        assert [e["outcome"] for e in audits] == [
+            "allowed"
+        ], "nothing to take back, nothing audited"
+
+    @pytest.mark.asyncio
+    async def test_a_second_holder_is_not_loosened_by_the_firsts_failed_step(
+        self, audits, session_map
+    ):
+        """Two modifiers on one thread reserve before either steer lands; the first
+        steer fails, the second lands. The mode must survive for the second."""
+        self._seed_header()
+        sm = session_map()
+        first = await privacy_mode.reserve(
+            privacy_mode.MODE_INCOGNITO, _TG_KEY, source="telegram", sessions=_Sessions(sm)
+        )
+        second = await privacy_mode.reserve(
+            privacy_mode.MODE_INCOGNITO, _TG_KEY, source="telegram", sessions=_Sessions(sm)
+        )
+        await privacy_mode.release(first, sessions=_Sessions(sm), source="telegram")
+        assert privacy_mode.is_incognito(_TG_KEY), "released from under the second holder"
+        assert sm.get_flag(_TG_KEY, "incognito") is True
+        privacy_mode.commit(second)
+        assert privacy_mode.is_incognito(_TG_KEY) and sm.get_flag(_TG_KEY, "incognito") is True
+        assert privacy_mode._pending == {}
+        assert [e["outcome"] for e in audits] == ["allowed"]
+
+    @pytest.mark.asyncio
+    async def test_when_every_holder_fails_the_last_release_takes_the_mode_back(
+        self, audits, session_map
+    ):
+        self._seed_header()
+        sm = session_map()
+        first = await privacy_mode.reserve(
+            privacy_mode.MODE_INCOGNITO, _TG_KEY, source="telegram", sessions=_Sessions(sm)
+        )
+        second = await privacy_mode.reserve(
+            privacy_mode.MODE_INCOGNITO, _TG_KEY, source="telegram", sessions=_Sessions(sm)
+        )
+        await privacy_mode.release(first, sessions=_Sessions(sm), source="telegram")
+        assert privacy_mode.is_incognito(_TG_KEY)
+        await privacy_mode.release(second, sessions=_Sessions(sm), source="telegram")
+        assert not privacy_mode.is_incognito(_TG_KEY)
+        assert sm.get_flag(_TG_KEY, "incognito") is False
+        assert privacy_mode._pending == {}
+        assert [e["outcome"] for e in audits] == ["allowed", "released"]
+
+    @pytest.mark.asyncio
+    async def test_a_committed_reservation_is_never_loosened_by_a_later_release(
+        self, audits, session_map
+    ):
+        self._seed_header()
+        sm = session_map()
+        first = await privacy_mode.reserve(
+            privacy_mode.MODE_INCOGNITO, _TG_KEY, source="telegram", sessions=_Sessions(sm)
+        )
+        second = await privacy_mode.reserve(
+            privacy_mode.MODE_INCOGNITO, _TG_KEY, source="telegram", sessions=_Sessions(sm)
+        )
+        privacy_mode.commit(first)
+        await privacy_mode.release(second, sessions=_Sessions(sm), source="telegram")
+        assert privacy_mode.is_incognito(_TG_KEY) and sm.get_flag(_TG_KEY, "incognito") is True
+        assert privacy_mode._pending == {}
+        assert [e["outcome"] for e in audits] == ["allowed"]
+
+    @pytest.mark.asyncio
+    async def test_reserve_refuses_like_apply_mode_and_leaves_no_pending_state(
+        self, audits, session_map, monkeypatch
+    ):
+        sm = session_map()
+        monkeypatch.setattr(sm, "set_flag", MagicMock(side_effect=OSError("disk full")))
+        with pytest.raises(privacy_mode.PrivacyModeRefused):
+            await privacy_mode.reserve(
+                privacy_mode.MODE_INCOGNITO, _TG_KEY, source="telegram", sessions=_Sessions(sm)
+            )
+        assert privacy_mode._pending == {} and not privacy_mode.is_incognito(_TG_KEY)
+
+    @pytest.mark.asyncio
+    @pytest.mark.asyncio
+    async def test_the_row_is_on_disk_before_apply_mode_returns(self, audits, session_map):
+        """The one form awaits the map's write before anything is published -- mark,
+        audit, header, hook, notice, return -- so a fresh map reads the row back
+        with no flush of the test's own. Mutation: skip the ``aflush`` in ``_land``
+        -- the fresh map reads no flag."""
+        sm = session_map()
+        applied = await privacy_mode.apply_mode(
+            privacy_mode.MODE_INCOGNITO, _TG_KEY, source="telegram", sessions=_Sessions(sm)
+        )
+        assert applied is True
+        assert session_map().get_flag(_TG_KEY, "incognito") is True, "the row was not durable"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_flush_publishes_nothing_and_refuses(
+        self, audits, session_map, monkeypatch
+    ):
+        """The row reached the map's memory but not the disk. Nothing is published:
+        no mark (``is_incognito`` False), no header stamp (the transcript header is
+        as it was), no mode-on notice -- the user is told the message was NOT
+        processed, one ``denied`` record is written and ``PrivacyModeRefused``
+        surfaces to the caller. The flag is back out of the map's memory too, so
+        a later hydrate cannot resurrect a row that never landed. Mutation: mark
+        before ``_land`` (the shape this replaces) -- red on ``is_incognito``, on
+        the header, and on the trail (``allowed`` ahead of ``denied``)."""
+        log = self._seed_header()
+        sm = session_map()
+        monkeypatch.setattr(sm, "aflush", AsyncMock(side_effect=OSError("disk full")))
+        rec = _Recorder()
+        with pytest.raises(privacy_mode.PrivacyModeRefused) as raised:
+            await privacy_mode.apply_mode(
+                privacy_mode.MODE_INCOGNITO,
+                _TG_KEY,
+                source="telegram",
+                sessions=_Sessions(sm),
+                notify=rec.notify,
+                on_applied=rec.on_applied,
+            )
+        assert raised.value.reason == privacy_mode.REFUSAL_PERSIST_FAILED
+        assert privacy_mode.is_incognito(_TG_KEY) is False, "a mark was published with no row"
+        assert privacy_mode.recorded_mode(_Sessions(sm), _TG_KEY) is None
+        assert sm.get_flag(_TG_KEY, "incognito") is False
+        assert "memory_mode" not in log.get_metadata(_TG_KEY), "the header was stamped"
+        assert rec.hooks == []
+        assert rec.notices == [privacy_mode.refusal_notice("incognito", "persist_failed")]
+        assert [e["outcome"] for e in audits] == ["denied"], "the trail claims an application"
+        assert privacy_mode._pending == {}
+
+    @pytest.mark.asyncio
+    async def test_a_release_whose_clear_cannot_reach_disk_retains_the_mode(
+        self, audits, session_map, monkeypatch
+    ):
+        """The mirror of the strict apply: a release publishes -- drops the mark,
+        reports ``released`` -- only after the flag's clear is on disk. When that
+        write fails the mode is RETAINED, fail-closed toward private: the flag is
+        back in the map, the mark never left, the header still says the mode, and
+        one ``retained`` record reports the failure instead of ``released``.
+        Mutation: drop the mark and report before the flush -- the mark is gone
+        with the clear still owed (red: ``is_incognito`` False, trail ``released``)."""
+        log = self._seed_header()
+        sm = session_map()
+        res = await privacy_mode.reserve(
+            privacy_mode.MODE_INCOGNITO, _TG_KEY, source="telegram", sessions=_Sessions(sm)
+        )
+        assert session_map().get_flag(_TG_KEY, "incognito") is True, "premise: the row is on disk"
+        monkeypatch.setattr(sm, "aflush", AsyncMock(side_effect=OSError("disk full")))
+        released = await privacy_mode.release(res, sessions=_Sessions(sm), source="telegram")
+        assert privacy_mode.is_incognito(_TG_KEY), "the mark was dropped with the clear still owed"
+        assert released is False
+        assert sm.get_flag(_TG_KEY, "incognito") is True
+        assert log.get_metadata(_TG_KEY).get("memory_mode") == "incognito"
+        assert [e["outcome"] for e in audits] == ["allowed", "retained"]
+        assert audits[-1]["resources"] == f"release_failed:persist_failed:{_TG_KEY}"
+        assert privacy_mode._pending == {}
+
+    @pytest.mark.asyncio
+    async def test_two_concurrent_reservations_cannot_erase_the_committed_mode(
+        self, audits, session_map, monkeypatch
+    ):
+        """Two ``!incognito`` on one key, the second arriving while the first's
+        application is still awaiting its header write. The shared holder is
+        registered before the first's first await, so the second JOINS it and waits;
+        when the second's step lands (commit) and the first's fails (release), the
+        committed mode survives and exactly one row exists. Mutation: register the
+        holder after the application -- the second creates its own holder, commits
+        and retires it, the first then registers a fresh one and its release erases
+        the mode the second committed (red: ``is_incognito`` False)."""
+        sm = session_map()
+        sessions = _Sessions(sm)
+        gate = asyncio.Event()
+        real_stamp = privacy_mode._persist_transcript_mode
+
+        async def _slow_stamp(session_key: str, mode: str) -> None:
+            await gate.wait()  # the first application is mid-await here
+            await real_stamp(session_key, mode)
+
+        monkeypatch.setattr(privacy_mode, "_persist_transcript_mode", _slow_stamp)
+        first = asyncio.create_task(
+            privacy_mode.reserve(
+                privacy_mode.MODE_INCOGNITO, _TG_KEY, source="telegram", sessions=sessions
+            )
+        )
+        for _ in range(200):  # past the header read, into the application, up to its stamp
+            await asyncio.sleep(0.005)
+            if privacy_mode.is_incognito(_TG_KEY):
+                break
+        assert privacy_mode.is_incognito(
+            _TG_KEY
+        ), "premise: the key is held as restricted before the await (the mark follows the header)"
+        assert not first.done(), "premise: the first application is still awaiting its stamp"
+
+        async def _reserve_then_steer_lands() -> privacy_mode.Reservation:
+            # The second modifier: its reservation returns and its steer lands at
+            # once -- so it commits the moment reserve hands it back.
+            res = await privacy_mode.reserve(
+                privacy_mode.MODE_INCOGNITO, _TG_KEY, source="telegram", sessions=sessions
+            )
+            privacy_mode.commit(res)
+            return res
+
+        second = asyncio.create_task(_reserve_then_steer_lands())
+        await asyncio.sleep(0)
+        second_waited = not second.done()  # asserted last: the ERASE is the finding
+        gate.set()
+        first_res, _second_res = await asyncio.gather(first, second)
+        await privacy_mode.release(
+            first_res, sessions=sessions, source="telegram"
+        )  # the first's steer did not land
+        assert privacy_mode.is_incognito(
+            _TG_KEY
+        ), "the committed mode was erased by the loser's release"
+        assert sm.get_flag(_TG_KEY, "incognito") is True
+        assert sm.privacy_flagged_entries() == {_TG_KEY: ["incognito"]}
+        assert privacy_mode._pending == {}
+        assert [e["outcome"] for e in audits] == ["allowed"]
+        assert second_waited, "the second caller must wait for the first application to settle"
+
+    @pytest.mark.asyncio
+    async def test_a_joiner_attempts_its_own_application_when_the_firsts_failed(
+        self, audits, session_map, monkeypatch
+    ):
+        """The first holder's application is refused (the map cannot write the row);
+        the joiner does not ride a failed application -- it attempts its own, which
+        the same map refuses too, and no pending state is left behind."""
+        sm = session_map()
+        sessions = _Sessions(sm)
+        gate = asyncio.Event()
+
+        real_set_flag = sm.set_flag
+
+        def _slow_failing_set_flag(key, flag, value):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(sm, "set_flag", _slow_failing_set_flag)
+        real_read = privacy_mode.asyncio.to_thread
+
+        async def _gated_to_thread(fn, *a, **kw):
+            await gate.wait()  # hold the first holder in its pre-application header read
+            return await real_read(fn, *a, **kw)
+
+        monkeypatch.setattr(privacy_mode.asyncio, "to_thread", _gated_to_thread)
+        first = asyncio.create_task(
+            privacy_mode.reserve(
+                privacy_mode.MODE_INCOGNITO, _TG_KEY, source="telegram", sessions=sessions
+            )
+        )
+        await asyncio.sleep(0)
+        second = asyncio.create_task(
+            privacy_mode.reserve(
+                privacy_mode.MODE_INCOGNITO, _TG_KEY, source="telegram", sessions=sessions
+            )
+        )
+        await asyncio.sleep(0)
+        assert not second.done()
+        gate.set()
+        results = await asyncio.gather(first, second, return_exceptions=True)
+        assert all(isinstance(r, privacy_mode.PrivacyModeRefused) for r in results), results
+        assert privacy_mode._pending == {} and not privacy_mode.is_incognito(_TG_KEY)
+        monkeypatch.setattr(sm, "set_flag", real_set_flag)
+
+    @pytest.mark.asyncio
+    async def test_releasing_one_mode_keeps_the_header_of_the_other_committed_mode(
+        self, audits, session_map
+    ):
+        """Two reservations of DIFFERENT modes on one key -- ``/temporary`` then
+        ``/incognito`` -- the incognito one commits, the temporary one releases.
+        The header must still record ``incognito``: a header-only reader
+        (``is_incognito_transcript``, the consolidator's header source) takes it
+        at its word, so a bare ``persistent`` there exposes the committed
+        incognito transcript. Mutation: restore the released reservation's own
+        ``header_before`` alone (the shape this replaces) -- red, the header reads
+        ``persistent`` while the incognito row and mark stand."""
+        log = self._seed_header()
+        sm = session_map()
+        sessions = _Sessions(sm)
+        temp = await privacy_mode.reserve(
+            privacy_mode.MODE_TEMPORARY, _TG_KEY, source="telegram", sessions=sessions
+        )
+        inco = await privacy_mode.reserve(
+            privacy_mode.MODE_INCOGNITO, _TG_KEY, source="telegram", sessions=sessions
+        )
+        assert log.get_metadata(_TG_KEY).get("memory_mode") == "temporary", "premise"
+        privacy_mode.commit(inco)
+        released = await privacy_mode.release(temp, sessions=sessions, source="telegram")
+        assert released is True
+        header = log.get_metadata(_TG_KEY).get("memory_mode")
+        assert header == "incognito", f"the committed incognito mode was erased: header={header!r}"
+        assert privacy_mode.is_incognito(_TG_KEY) and not privacy_mode.is_temporary(_TG_KEY)
+        assert sm.privacy_flagged_entries() == {_TG_KEY: ["incognito"]}
+        assert privacy_mode.recorded_mode(sessions, _TG_KEY) == "incognito"
+        assert privacy_mode._pending == {}
+
+    @pytest.mark.asyncio
+    async def test_releasing_the_weaker_mode_leaves_the_stricter_committed_header(
+        self, audits, session_map
+    ):
+        """The other order: ``/incognito`` reserved first, ``/temporary`` second and
+        committed, incognito released. The header records ``temporary`` (the
+        stricter stamp) and must keep it -- the restore is guarded by "the header
+        still records the released mode" AND targets the strictest claim standing,
+        and either alone would do here; both are asserted."""
+        log = self._seed_header()
+        sm = session_map()
+        sessions = _Sessions(sm)
+        inco = await privacy_mode.reserve(
+            privacy_mode.MODE_INCOGNITO, _TG_KEY, source="telegram", sessions=sessions
+        )
+        temp = await privacy_mode.reserve(
+            privacy_mode.MODE_TEMPORARY, _TG_KEY, source="telegram", sessions=sessions
+        )
+        privacy_mode.commit(temp)
+        assert (
+            privacy_mode._restore_target(sessions, _TG_KEY, privacy_mode.MODE_INCOGNITO, None)
+            == "temporary"
+        )
+        assert await privacy_mode.release(inco, sessions=sessions, source="telegram") is True
+        assert log.get_metadata(_TG_KEY).get("memory_mode") == "temporary"
+        assert privacy_mode.is_temporary(_TG_KEY) and not privacy_mode.is_incognito(_TG_KEY)
+
+    def test_the_restore_target_ranks_every_claim_normalized(self, session_map):
+        """``header_before`` is normalized before ranking (a mixed-case ``Temporary``
+        is ``temporary``, a foreign value is nothing); a mode held in flight for
+        the session counts as a claim; ``persistent`` only when nothing stands."""
+        sm = session_map()
+        sessions = _Sessions(sm)
+        target = privacy_mode._restore_target
+        assert target(sessions, _TG_KEY, "incognito", None) == "persistent"
+        assert target(sessions, _TG_KEY, "incognito", "Persistent") == "persistent"
+        assert target(sessions, _TG_KEY, "incognito", "Temporary") == "temporary"
+        privacy_mode.mark_incognito(_TG_KEY)
+        assert target(sessions, _TG_KEY, "temporary", None) == "incognito"
+        privacy_mode._pending[("temporary", _TG_KEY)] = privacy_mode._Pending(
+            settled=asyncio.Event()
+        )
+        assert target(sessions, _TG_KEY, "incognito", None) == "temporary"
+
+    @pytest.mark.asyncio
+    async def test_a_modifier_arriving_during_a_release_waits_and_lands_its_own_row(
+        self, audits, session_map, monkeypatch
+    ):
+        """A declined steer releases its reservation; while the release awaits its
+        durable clear the mark still stands (it is dropped last). A same-mode
+        message arriving in that window must not run under that mark -- it would
+        lose the mode when the clear landed under it -- so the group stays
+        registered, ``releasing``, the request waits, and once the release has
+        settled it lands a row of its own. Mutation: pop the group before the
+        awaited clear (the r26 shape) -- red: the request reads "already applied"
+        off the mark, returns at once, and the release then drops row, header
+        and mark under it (``marked=False, row=False, applied=False``).
+        """
+        from kiro_crew.history import transcript_privacy_mode
+
+        log = self._seed_header()
+        sm = session_map()
+        sessions = _Sessions(sm)
+        res = await privacy_mode.reserve(
+            privacy_mode.MODE_INCOGNITO, _TG_KEY, source="telegram", sessions=sessions
+        )
+        await _land_on_disk(sm)
+        gate = asyncio.Event()
+        in_clear = asyncio.Event()
+        real_aflush = sm.aflush
+
+        async def _slow_flush() -> None:
+            in_clear.set()
+            await gate.wait()
+            await real_aflush()
+
+        monkeypatch.setattr(sm, "aflush", _slow_flush)
+        releasing = asyncio.create_task(
+            privacy_mode.release(res, sessions=sessions, source="telegram")
+        )
+        await asyncio.wait_for(in_clear.wait(), timeout=5)
+        assert privacy_mode.is_incognito(_TG_KEY), "premise: the mark stands during the clear"
+        assert privacy_mode.is_provisional(
+            privacy_mode.MODE_INCOGNITO, _TG_KEY
+        ), "a release in flight is provisional: the mode may be gone in a moment"
+        rec = _Recorder()
+        arriving = asyncio.create_task(
+            privacy_mode.apply_mode(
+                privacy_mode.MODE_INCOGNITO,
+                _TG_KEY,
+                source="telegram",
+                sessions=sessions,
+                notify=rec.notify,
+            )
+        )
+        await asyncio.sleep(0.01)
+        request_waited = not arriving.done()  # asserted last: the lost mode is the finding
+        gate.set()
+        released = await releasing
+        applied = await arriving
+        await _land_on_disk(sm)
+        marked = privacy_mode.is_incognito(_TG_KEY)
+        row = sm.get_flag(_TG_KEY, "incognito")
+        assert marked and row and applied is True, (
+            "the concurrent modifier ran on a mark the release then dropped: "
+            f"marked={marked}, row={row}, applied={applied}"
+        )
+        assert released is True, "the release itself still took the reservation back"
+        assert sm.privacy_flagged_entries() == {_TG_KEY: ["incognito"]}
+        assert transcript_privacy_mode(log.get_metadata(_TG_KEY).get("memory_mode")) == "incognito"
+        assert privacy_mode._pending == {}
+        assert [e["outcome"] for e in audits] == ["allowed", "released", "allowed"]
+        assert rec.notices == [privacy_mode.NOTICE_INCOGNITO]
+        assert request_waited, "the request must wait for the release to settle, not ride the mark"
+
+    @pytest.mark.asyncio
+    async def test_is_provisional_names_a_mode_that_may_yet_be_taken_back(
+        self, audits, session_map, monkeypatch
+    ):
+        """``is_provisional`` is what the consolidator's refusal memo asks before
+        remembering a refused session: True for a reservation whose step has not
+        landed and for a commit whose write is in flight, False once committed or
+        when nothing is pending."""
+        sm = session_map()
+        sessions = _Sessions(sm)
+        assert privacy_mode.is_provisional(privacy_mode.MODE_INCOGNITO, _TG_KEY) is False
+        res = await privacy_mode.reserve(
+            privacy_mode.MODE_INCOGNITO, _TG_KEY, source="telegram", sessions=sessions
+        )
+        assert privacy_mode.is_provisional(privacy_mode.MODE_INCOGNITO, _TG_KEY) is True
+        assert privacy_mode.is_provisional(privacy_mode.MODE_TEMPORARY, _TG_KEY) is False
+        privacy_mode.commit(res)
+        assert privacy_mode.is_provisional(privacy_mode.MODE_INCOGNITO, _TG_KEY) is False
+        # A plain application is provisional for exactly the span of its write.
+        gate = asyncio.Event()
+        real_stamp = privacy_mode._persist_transcript_mode
+
+        async def _slow_stamp(session_key: str, mode: str) -> None:
+            await gate.wait()
+            await real_stamp(session_key, mode)
+
+        monkeypatch.setattr(privacy_mode, "_persist_transcript_mode", _slow_stamp)
+        applying = asyncio.create_task(
+            privacy_mode.apply_mode(
+                privacy_mode.MODE_TEMPORARY, _TG_KEY, source="telegram", sessions=sessions
+            )
+        )
+        for _ in range(200):
+            await asyncio.sleep(0.005)
+            if privacy_mode.is_provisional(privacy_mode.MODE_TEMPORARY, _TG_KEY):
+                break
+        assert privacy_mode.is_provisional(privacy_mode.MODE_TEMPORARY, _TG_KEY) is True
+        gate.set()
+        assert await applying is True
+        assert privacy_mode.is_provisional(privacy_mode.MODE_TEMPORARY, _TG_KEY) is False
+        assert privacy_mode.is_temporary(_TG_KEY) is True
+
+
+class TestAnInFlightCommitIsHeldNotPublished:
+    """Between the modifier and its row landing on disk, the key is HELD: the
+    predicates answer restricted (a concurrent message runs restricted, never
+    persistent), yet nothing is published -- no mark, no header, no notice -- and
+    the hold vanishes with a write that fails."""
+
+    @staticmethod
+    def _gated_flush(sm, gate: asyncio.Event, *, fail: bool):
+        real = sm.aflush
+
+        async def _aflush() -> None:
+            await gate.wait()
+            if fail:
+                raise OSError("disk full")
+            await real()
+
+        return _aflush
+
+    @pytest.mark.asyncio
+    async def test_the_key_is_restricted_while_the_row_lands_and_free_if_it_fails(
+        self, audits, session_map, monkeypatch
+    ):
+        """Mutation: drop the ``_held`` term from the predicates -- red on the first
+        block (a message arriving mid-write would run persistent); publish the mark
+        ahead of the flush -- red on the second (the tracker holds a key whose row
+        never landed)."""
+        sm = session_map()
+        sessions = _Sessions(sm)
+        gate = asyncio.Event()
+        monkeypatch.setattr(sm, "aflush", self._gated_flush(sm, gate, fail=True))
+        rec = _Recorder()
+        task = asyncio.create_task(
+            privacy_mode.apply_mode(
+                privacy_mode.MODE_INCOGNITO,
+                _TG_KEY,
+                source="telegram",
+                sessions=sessions,
+                notify=rec.notify,
+            )
+        )
+        for _ in range(50):
+            await asyncio.sleep(0.002)
+            if privacy_mode._landing(privacy_mode.MODE_INCOGNITO, _TG_KEY):
+                break
+        assert privacy_mode._landing("incognito", _TG_KEY), "premise: the write is in flight"
+        # Held, not published.
+        assert privacy_mode.is_incognito(_TG_KEY) and privacy_mode.is_restricted(_TG_KEY)
+        assert privacy_mode.recorded_mode(sessions, _TG_KEY) == "incognito"
+        assert _TG_KEY not in privacy_mode._incognito, "the mark was published before the row"
+        privacy_mode.hydrate(sessions, _TG_KEY)
+        assert _TG_KEY not in privacy_mode._incognito, "hydrate published a row still landing"
+        assert rec.notices == [] and audits == []
+        gate.set()
+        with pytest.raises(privacy_mode.PrivacyModeRefused):
+            await task
+        # The hold is gone with the write.
+        assert not privacy_mode.is_restricted(_TG_KEY)
+        assert privacy_mode.recorded_mode(sessions, _TG_KEY) is None
+        assert sm.get_flag(_TG_KEY, "incognito") is False
+        assert privacy_mode._pending == {}
+        assert [e["outcome"] for e in audits] == ["denied"]
+
+    @pytest.mark.asyncio
+    async def test_the_mark_lands_once_the_row_is_on_disk(self, audits, session_map, monkeypatch):
+        """The success half: the mark, the ``allowed`` record and the notice all
+        follow the flush, and a fresh map reads the row back."""
+        sm = session_map()
+        sessions = _Sessions(sm)
+        gate = asyncio.Event()
+        monkeypatch.setattr(sm, "aflush", self._gated_flush(sm, gate, fail=False))
+        rec = _Recorder()
+        task = asyncio.create_task(
+            privacy_mode.apply_mode(
+                privacy_mode.MODE_INCOGNITO,
+                _TG_KEY,
+                source="telegram",
+                sessions=sessions,
+                notify=rec.notify,
+            )
+        )
+        for _ in range(50):
+            await asyncio.sleep(0.002)
+            if privacy_mode._landing(privacy_mode.MODE_INCOGNITO, _TG_KEY):
+                break
+        assert _TG_KEY not in privacy_mode._incognito and audits == [] and rec.notices == []
+        gate.set()
+        assert await task is True
+        assert _TG_KEY in privacy_mode._incognito
+        assert session_map().get_flag(_TG_KEY, "incognito") is True
+        assert [e["outcome"] for e in audits] == ["allowed"]
+        assert rec.notices == [privacy_mode.NOTICE_INCOGNITO]
+        assert privacy_mode._pending == {}
+
+    @pytest.mark.asyncio
+    async def test_a_second_modifier_during_the_write_joins_and_commits_the_group(
+        self, audits, session_map, monkeypatch
+    ):
+        """A concurrent ``apply_mode`` for the same (mode, key) finds the group and
+        waits instead of re-committing: one row, one ``allowed`` record, one notice;
+        and because its message runs under the mode it COMMITS the group, so a
+        reservation riding the same group cannot take the mode back."""
+        sm = session_map()
+        sessions = _Sessions(sm)
+        gate = asyncio.Event()
+        monkeypatch.setattr(sm, "aflush", self._gated_flush(sm, gate, fail=False))
+        rec = _Recorder()
+        first = asyncio.create_task(
+            privacy_mode.reserve(
+                privacy_mode.MODE_INCOGNITO,
+                _TG_KEY,
+                source="telegram",
+                sessions=sessions,
+                notify=rec.notify,
+            )
+        )
+        for _ in range(50):
+            await asyncio.sleep(0.002)
+            if privacy_mode._landing(privacy_mode.MODE_INCOGNITO, _TG_KEY):
+                break
+        second = asyncio.create_task(
+            privacy_mode.apply_mode(
+                privacy_mode.MODE_INCOGNITO,
+                _TG_KEY,
+                source="telegram",
+                sessions=sessions,
+                notify=rec.notify,
+            )
+        )
+        await asyncio.sleep(0)
+        assert not second.done(), "the second modifier must wait for the write in flight"
+        gate.set()
+        res, applied_by_second = await asyncio.gather(first, second)
+        assert applied_by_second is False
+        assert [e["outcome"] for e in audits] == ["allowed"]
+        assert rec.notices == [privacy_mode.NOTICE_INCOGNITO]
+        # The plain modifier's message ran under the mode: the reservation's failed
+        # step must not loosen it.
+        assert await privacy_mode.release(res, sessions=sessions, source="telegram") is False
+        assert privacy_mode.is_incognito(_TG_KEY) and sm.get_flag(_TG_KEY, "incognito") is True
+
+
+class TestPublishOnlyThroughTheCommitPrimitive:
+    """The structural pin for the durable-first shape, over the module's AST.
+
+    Four heads of one family (a steer before the row, a debounced flush, the
+    release path, the mark) were each closed at a call site; this pins the
+    SHAPE instead, so a fifth call site cannot appear unnoticed: the durable
+    write and its flush live in ``_land`` alone, the publication (``mark``)
+    is reached only through ``_commit_mode`` -- after ``_land`` -- plus the
+    restore-from-durable ``hydrate`` and the two in-memory-only wrappers, and
+    the unpublish (``_tracker(...).pop``) only through ``_release_mode``.
+    """
+
+    @staticmethod
+    def _tree():
+        import ast
+        import inspect
+
+        return ast.parse(inspect.getsource(privacy_mode))
+
+    @classmethod
+    def _callers(cls, matches) -> dict[str, list[int]]:
+        """Top-level function name -> line numbers of the calls *matches* accepts."""
+        import ast
+
+        found: dict[str, list[int]] = {}
+        for node in cls._tree().body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Call) and matches(sub.func):
+                    found.setdefault(node.name, []).append(sub.lineno)
+        return found
+
+    @staticmethod
+    def _is_name(name: str):
+        import ast
+
+        return lambda func: isinstance(func, ast.Name) and func.id == name
+
+    @staticmethod
+    def _is_attr(attr: str):
+        import ast
+
+        return lambda func: isinstance(func, ast.Attribute) and func.attr == attr
+
+    def test_the_durable_write_and_its_flush_live_in_land_alone(self):
+        assert set(self._callers(self._is_attr("set_flag"))) == {"_land"}
+        assert set(self._callers(self._is_attr("aflush"))) == {"_land"}
+
+    def test_mark_is_reached_only_through_the_primitive_hydrate_and_the_wrappers(self):
+        callers = self._callers(self._is_name("mark"))
+        assert set(callers) == {"_commit_mode", "hydrate", "mark_temporary", "mark_incognito"}, (
+            "a new publication site: every mode must be published by _commit_mode, "
+            f"after its row is on disk -- found {sorted(callers)}"
+        )
+
+    def test_in_the_primitive_the_row_lands_before_the_mark(self):
+        land = self._callers(self._is_name("_land"))
+        mark = self._callers(self._is_name("mark"))
+        assert set(land) == {"_commit_mode", "_release_mode"}
+        assert max(land["_commit_mode"]) < min(
+            mark["_commit_mode"]
+        ), "_commit_mode publishes before it lands the row"
+
+    def test_in_the_primitive_the_header_is_written_after_the_row_and_before_the_mark(self):
+        """The header is the second durable record (the one the out-of-process gates
+        read), so it belongs to the durable step: after the row, before the mark.
+        Mutation: stamp it after the mark (the r26 order) -- red."""
+        land = self._callers(self._is_name("_land"))["_commit_mode"]
+        header = self._callers(self._is_name("_persist_transcript_mode"))["_commit_mode"]
+        mark = self._callers(self._is_name("mark"))["_commit_mode"]
+        assert (
+            min(land) < min(header) < min(mark)
+        ), "the header must be written after the row lands and before the mode is published"
+
+    def test_the_primitive_and_its_mirror_have_exactly_these_callers(self):
+        import ast
+
+        assert set(self._callers(self._is_name("_commit_mode"))) == {"apply_mode", "reserve"}
+        assert set(self._callers(self._is_name("_release_mode"))) == {"release"}
+        assert set(self._callers(self._is_name("_persist_transcript_mode"))) == {"_commit_mode"}
+        # The header write is handed to ``to_thread`` rather than called, so it is
+        # pinned by attribute reference.
+        header_writers = {
+            node.name
+            for node in self._tree().body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and any(
+                isinstance(sub, ast.Attribute) and sub.attr == "update_metadata_if"
+                for sub in ast.walk(node)
+            )
+        }
+        assert header_writers == {"_persist_transcript_mode", "_release_mode"}
+
+        def _tracker_pop(func) -> bool:
+            return (
+                isinstance(func, ast.Attribute)
+                and func.attr == "pop"
+                and isinstance(func.value, ast.Call)
+                and isinstance(func.value.func, ast.Name)
+                and func.value.func.id == "_tracker"
+            )
+
+        assert set(self._callers(_tracker_pop)) == {"_release_mode"}
+
+    def test_no_module_outside_privacy_mode_publishes_a_mode(self):
+        """Across ``src/``: no call of the publication functions and no direct write
+        of a privacy flag outside this module. The Slack handler's ``_mark_*``
+        names are aliases for tests, never called in production code."""
+        import re
+        from pathlib import Path
+
+        import kiro_crew
+
+        root = Path(kiro_crew.__file__).resolve().parent
+        publish = re.compile(
+            r"(privacy_mode\.mark\(|\bmark_temporary\(|\bmark_incognito\(|_mark_temporary\(|_mark_incognito\()"
+        )
+        flag_write = re.compile(
+            r"set_flag\([^)]*(MODE_TEMPORARY|MODE_INCOGNITO|\"temporary\"|\"incognito\")[^)]*,\s*True\)"
+        )
+        offenders: list[str] = []
+        for path in root.rglob("*.py"):
+            if path.name == "privacy_mode.py" and path.parent.name == "messaging":
+                continue
+            text = path.read_text(encoding="utf-8")
+            for lineno, line in enumerate(text.splitlines(), 1):
+                if publish.search(line) or flag_write.search(line):
+                    offenders.append(f"{path.relative_to(root)}:{lineno}: {line.strip()}")
+        assert offenders == [], "\n".join(offenders)
+
+
+class TestAHeaderAlreadyAtTheModeIsNotRewritten:
+    """The stamp is tighten-only AND write-free when the header already records
+    the mode: a restart re-applies the modifier (the trackers start empty), and
+    the startup stamp visits every flagged row on every boot -- neither may
+    rewrite an unchanged header. Mutation: ``needs_tightening`` without the
+    equality short-circuit -- the second application writes again."""
+
+    @pytest.mark.asyncio
+    async def test_reapplying_after_a_restart_writes_the_header_once(
+        self, audits, session_map, monkeypatch
+    ):
+        from kiro_crew.history import ConversationLog
+
+        log = TestTranscriptHeaderDurability._log()
+        writes: list[str] = []
+        real_write = ConversationLog._update_metadata_locked
+
+        def _counting(self, key, fields):
+            writes.append(key)
+            return real_write(self, key, fields)
+
+        monkeypatch.setattr(ConversationLog, "_update_metadata_locked", _counting)
+        sm = session_map()
+        await privacy_mode.apply_mode(
+            privacy_mode.MODE_INCOGNITO, _TG_KEY, source="telegram", sessions=_Sessions(sm)
+        )
+        await _land_on_disk(sm)
+        assert writes == [_TG_KEY], "premise: the first application stamps the header"
+        assert log.get_metadata(_TG_KEY).get("memory_mode") == "incognito"
+        privacy_mode.reset()  # the restart: the trackers start empty, the map is on disk
+        await privacy_mode.apply_mode(
+            privacy_mode.MODE_INCOGNITO, _TG_KEY, source="telegram", sessions=_Sessions(sm)
+        )
+        await _land_on_disk(sm)
+        assert writes == [_TG_KEY], "a header already recording the mode was rewritten"
+
+    @pytest.mark.parametrize(
+        ("current", "mode", "expected"),
+        [
+            ("", "incognito", True),
+            ("incognito", "temporary", True),
+            ("incognito", "incognito", False),
+            ("temporary", "incognito", False),
+            ("temporary", "temporary", False),
+        ],
+    )
+    def test_needs_tightening(self, current, mode, expected):
+        assert privacy_mode.needs_tightening(current, mode) is expected
