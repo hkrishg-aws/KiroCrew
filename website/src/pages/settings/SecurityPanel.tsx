@@ -2657,6 +2657,65 @@ function LayersSection() {
   )
 }
 
+/* ── Redaction: hosts allowed long queries, per workspace ── */
+export function RedactionAllowedHostsCard() {
+  const queryClient = useQueryClient()
+  const { data, isLoading, error } = useQuery({
+    queryKey: ['redaction-allowed-hosts'],
+    queryFn: () => api.redactionAllowedHosts(),
+  })
+  const revoke = useMutation({
+    mutationFn: ({ workspace, host }: { workspace: string; host: string }) => api.redactionRevokeHost(workspace, host),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['redaction-allowed-hosts'] }),
+  })
+  const rows = Object.entries(data?.workspaces ?? {}).flatMap(([workspace, hosts]) => hosts.map(host => ({ workspace, host })))
+  return (
+    <SettingsCard>
+      <div className="mb-3 text-[12px] leading-relaxed text-muted" data-testid="redaction-settings-note">
+        {i18nT('pages.settings.securityPanel.redaction_always_on')}
+      </div>
+      <ErrorNotice
+        variant="inline"
+        askAgent
+        message={error ? i18nT('pages.settings.securityPanel.redaction_load_failed') : null}
+      />
+      <ErrorNotice
+        variant="inline"
+        askAgent
+        message={revoke.isError ? i18nT('pages.settings.securityPanel.redaction_revoke_failed') : null}
+        onDismiss={() => revoke.reset()}
+      />
+      {!isLoading && !error && rows.length === 0 && (
+        <div className="text-[12px] text-muted" data-testid="redaction-allowed-empty">
+          {i18nT('pages.settings.securityPanel.redaction_no_allowed_hosts')}
+        </div>
+      )}
+      {rows.length > 0 && (
+        <div className="divide-y divide-border" data-testid="redaction-allowed-list">
+          {rows.map(({ workspace, host }) => (
+            <div key={`${workspace}\u0000${host}`} className="flex items-center justify-between gap-3 py-2">
+              <div className="min-w-0">
+                <div className="truncate font-mono text-[13px] text-text">{host}</div>
+                <div className="text-[11px] text-muted">
+                  {i18nT('pages.settings.securityPanel.redaction_workspace', { workspace })}
+                </div>
+              </div>
+              <Btn
+                danger
+                disabled={revoke.isPending}
+                onClick={() => revoke.mutate({ workspace, host })}
+                data-testid="redaction-revoke"
+              >
+                {i18nT('pages.settings.securityPanel.redaction_revoke')}
+              </Btn>
+            </div>
+          ))}
+        </div>
+      )}
+    </SettingsCard>
+  )
+}
+
 /* ── Documentation section ── */
 function DocsSection() {
   return (
@@ -2687,7 +2746,7 @@ function DocsSection() {
  * The rail states which is which before any row is read, and the two large
  * tables (137 rules, ~20 governed scopes) get a pane instead of a fold.
  */
-type SecuritySectionKey = 'posture' | 'approval' | 'rules' | 'tailnet' | 'apps' | 'delivery' | 'layers' | 'governance' | 'docs'
+type SecuritySectionKey = 'posture' | 'approval' | 'rules' | 'tailnet' | 'apps' | 'redaction' | 'delivery' | 'layers' | 'governance' | 'docs'
 type SecuritySectionGroup = 'status' | 'yours' | 'enforced' | 'reference'
 
 interface SecuritySectionDef {
@@ -2713,6 +2772,7 @@ export const SECTION_LABEL_KEY: Record<SecuritySectionKey, string> = {
   rules: 'pages.settings.securityPanel.denied_commands',
   tailnet: 'pages.settings.securityPanel.tailnet_section',
   apps: 'pages.settings.securityPanel.third_party_apps_section',
+  redaction: 'pages.settings.securityPanel.redaction_section',
   delivery: 'pages.settings.securityPanel.file_delivery_section',
   layers: 'pages.settings.securityPanel.defense_in_depth_architecture',
   governance: 'pages.settings.securityPanel.governance_policy',
@@ -2735,6 +2795,7 @@ const SECURITY_SECTIONS: readonly SecuritySectionDef[] = [
   { key: 'rules', icon: <Terminal size={15} />, group: 'yours' },
   { key: 'tailnet', icon: <Network size={15} />, group: 'yours' },
   { key: 'apps', icon: <Boxes size={15} />, group: 'yours' },
+  { key: 'redaction', icon: <EyeOff size={15} />, group: 'yours' },
   { key: 'delivery', icon: <FileWarning size={15} />, group: 'yours' },
   { key: 'layers', icon: <Layers size={15} />, group: 'enforced' },
   { key: 'governance', icon: <Gavel size={15} />, group: 'enforced' },
@@ -2921,6 +2982,11 @@ export function SecurityPanel({ basePath }: { basePath?: string } = {}) {
             {key === 'apps' && (
               <SettingsSection title={i18nT('pages.settings.securityPanel.third_party_apps_section')}>
                 <ThirdPartyAppsCard />
+              </SettingsSection>
+            )}
+            {key === 'redaction' && (
+              <SettingsSection title={i18nT('pages.settings.securityPanel.redaction_section')}>
+                <RedactionAllowedHostsCard />
               </SettingsSection>
             )}
             {key === 'delivery' && (

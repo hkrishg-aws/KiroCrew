@@ -383,8 +383,8 @@ copied code blocks, and copying should turn each marker into `<REDACTED>`. Use
 the same blocked-link chip in every version. Keep the existing placeholder tag
 and store that value's rule and source in its metadata. Only the session owner
 sees actions; Slack and other shared pages show explanatory text without
-actions. On phones the cards open as bottom sheets; on desktop they open
-beside the message.
+actions. On phones and desktop alike, a card opens inline, below the block it
+explains.
 
 ## What does not change
 
