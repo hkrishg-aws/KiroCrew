@@ -2262,12 +2262,59 @@ CHAT_FOLDER_TREE_SCHEMA = ToolSchema(
     fields=[],
 )
 
+# A folder's project directory, as the folder endpoints take it. Length-bounded
+# ONLY (4096 = Linux PATH_MAX, the same bound ``set_project`` uses): every rule
+# about the path itself — absolute or ``~``-prefixed, must be an existing
+# directory, never a sensitive location — is ``chat_folders._validate_project_dir``
+# (plus, on macOS only, the voice-runtime workspace-overlap guard), run
+# by the endpoint the tool posts to. Deliberately no shape pattern here: the
+# kiro-cli subprocess tree these servers run in is sandboxed (``sandbox.py``
+# hides credential paths from it), so a filesystem check in THIS process would
+# not see what the gateway sees, and a stricter shape gate (``set_project``'s
+# leading-``/`` regex) would refuse the ``~`` form the endpoint accepts. One
+# validator, in the process that owns the store.
+_CHAT_FOLDER_PROJECT_DIR_MAX = 4096
+
 CHAT_FOLDER_CREATE_SCHEMA = ToolSchema(
     tool_name="chat_folder_create",
     fields=[
         FieldSpec("name", str, required=True, max_len=_ARTIFACT_FOLDER_NAME_MAX),
         FieldSpec("parent", str, max_len=_ARTIFACT_FOLDER_REF_MAX),
+        # Optional at create so a folder can be born bound to its project: a
+        # chat opened inside a folder inherits the folder's project directory
+        # at creation, which is the only zero-cost path to a project-scoped
+        # session (context is injected once at session start).
+        FieldSpec("project_dir", str, max_len=_CHAT_FOLDER_PROJECT_DIR_MAX),
     ],
+)
+
+
+def _validate_chat_folder_update(cleaned: dict[str, Any]) -> None:
+    """``project_dir`` must be PRESENT — ``""`` included, since that is the
+    PATCH route's own "clear" spelling. ``FieldSpec(required=True)`` refuses a
+    string that is empty after sanitization, so it cannot express "required,
+    and the empty string is a legal value"; this is the same reason
+    ``set_project.path`` is a non-required field behind a custom validator."""
+    if "project_dir" not in cleaned:
+        raise ValidationError(
+            "project_dir",
+            "required (an absolute path to bind the folder to a project, or '' to clear)",
+        )
+
+
+CHAT_FOLDER_UPDATE_SCHEMA = ToolSchema(
+    tool_name="chat_folder_update",
+    fields=[
+        # The folder to change, by id or human path -- the same reference shape
+        # ``chat_folder_move.folder`` takes. ``project_dir`` is the verb's ONE
+        # settable field and is required; see ``_validate_chat_folder_update``
+        # for why the requirement is a custom validator rather than
+        # ``required=True``. An empty string CLEARS the binding, exactly as the
+        # PATCH route reads it.
+        FieldSpec("folder", str, required=True, max_len=_ARTIFACT_FOLDER_REF_MAX),
+        FieldSpec("project_dir", str, max_len=_CHAT_FOLDER_PROJECT_DIR_MAX),
+    ],
+    custom_validator=_validate_chat_folder_update,
 )
 
 CHAT_FOLDER_MOVE_SCHEMA = ToolSchema(
@@ -3640,6 +3687,7 @@ MCP_DASHBOARD_SCHEMAS: dict[str, ToolSchema] = {
     "session_read_message": SESSION_READ_MESSAGE_SCHEMA,
     "chat_folder_tree": CHAT_FOLDER_TREE_SCHEMA,
     "chat_folder_create": CHAT_FOLDER_CREATE_SCHEMA,
+    "chat_folder_update": CHAT_FOLDER_UPDATE_SCHEMA,
     "chat_folder_move": CHAT_FOLDER_MOVE_SCHEMA,
     "chat_folder_move_session": CHAT_FOLDER_MOVE_SESSION_SCHEMA,
     "chat_folder_file_self": CHAT_FOLDER_FILE_SELF_SCHEMA,

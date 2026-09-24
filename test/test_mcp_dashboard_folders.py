@@ -19,7 +19,7 @@ import pytest
 
 from kiro_crew import mcp_dashboard
 from kiro_crew.mcp_dashboard import _call_tool_inner, _list_tools
-from kiro_crew.validation import ValidationError
+from kiro_crew.validation import ValidationError, validate_mcp_tool_arguments
 
 # Representative GET /api/chat/folders body — a bare JSON array (no envelope),
 # each row carrying only parent_id (the human path is derived client-side).
@@ -317,6 +317,542 @@ class TestFolderCreate:
         # validation.TOOL_SCHEMAS precisely so that guard runs).
         with pytest.raises(ValidationError):
             _call_tool_inner("chat_folder_create", {"parent": "kirocrew"})
+
+
+class TestFolderCreateProjectDir:
+    """``project_dir`` rides the create POST; the endpoint owns every rule about it.
+
+    A folder's project directory is what a session created inside it inherits
+    at creation — the only zero-cost path to a project-scoped session — so the
+    tool that creates folders has to be able to bind one. The tool adds
+    exactly one key to the body it already sends and re-implements no path
+    check (its one pre-check is the endpoint's own lexical UNC helper, pinned
+    in ``TestAUncProjectDirNeverLeavesTheTool``): the
+    path is validated by ``chat_folders._validate_project_dir`` plus the
+    overlap guard inside the endpoint, whose refusal is surfaced verbatim.
+    """
+
+    def test_project_dir_rides_the_create_post(self) -> None:
+        made = {
+            "id": "dddddddddddd",
+            "name": "Radar",
+            "parent_id": "",
+            "project_dir": "/srv/projects/radar",
+        }
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._post", return_value=made) as mock_post,
+        ):
+            out = _call_tool_inner(
+                "chat_folder_create", {"name": "Radar", "project_dir": "/srv/projects/radar"}
+            )
+        path, body = mock_post.call_args.args
+        assert path == "/api/chat/folders"
+        assert body == {"name": "Radar", "parent_id": "", "project_dir": "/srv/projects/radar"}
+        assert mock_post.call_args.kwargs["session_key"] == "dashboard:chat-1-100"
+        assert "dddddddddddd" in out
+        # The STORED path is reported (the endpoint expands ~ and resolves links).
+        assert "Project directory: /srv/projects/radar" in out
+
+    def test_the_stored_path_is_what_gets_reported(self) -> None:
+        """The endpoint canonicalises; the result names what a session will inherit."""
+        made = {
+            "id": "dddddddddddd",
+            "name": "Home",
+            "parent_id": "",
+            "project_dir": "/home/me/proj",
+        }
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._post", return_value=made),
+        ):
+            out = _call_tool_inner("chat_folder_create", {"name": "Home", "project_dir": "~/proj"})
+        assert "Project directory: /home/me/proj" in out
+        assert "~/proj" not in out
+
+    def test_a_call_without_project_dir_posts_exactly_the_body_it_always_did(self) -> None:
+        """The pin for 'nothing else changes': no ``project_dir`` key appears at
+        all, so the endpoint reads an absent binding exactly as before."""
+        made = {"id": "eeeeeeeeeeee", "name": "Solo", "parent_id": ""}
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._post", return_value=made) as mock_post,
+        ):
+            out = _call_tool_inner("chat_folder_create", {"name": "Solo"})
+        assert mock_post.call_args.args[1] == {"name": "Solo", "parent_id": ""}
+        assert out == "Created folder `Solo` (id=eeeeeeeeeeee)."
+
+    def test_an_empty_project_dir_is_the_same_as_omitting_it(self) -> None:
+        made = {"id": "eeeeeeeeeeee", "name": "Solo", "parent_id": ""}
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._post", return_value=made) as mock_post,
+        ):
+            _call_tool_inner("chat_folder_create", {"name": "Solo", "project_dir": "  "})
+        assert mock_post.call_args.args[1] == {"name": "Solo", "parent_id": ""}
+
+    @pytest.mark.parametrize(
+        "refusal",
+        [
+            "project_dir refers to a sensitive path",
+            "Project directory must be an existing directory",
+            "Project directory must be an absolute path",
+        ],
+    )
+    def test_the_endpoints_path_refusal_is_surfaced_verbatim(self, refusal: str) -> None:
+        """The tool pre-judges nothing about the path: whatever the endpoint's
+        validator says comes back as the tool's error, and the create it refused
+        is reported as refused (no id, no 'Created')."""
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._post", return_value={"error": refusal}) as mock_post,
+        ):
+            out = _call_tool_inner(
+                "chat_folder_create", {"name": "Keys", "project_dir": "/home/me/.aws"}
+            )
+        assert out == f"Error: {refusal}"
+        # One POST — the leaf itself — and it was refused; nothing else was written.
+        assert mock_post.call_count == 1
+
+    def test_a_refused_leaf_still_reports_the_parent_segments_it_created(self) -> None:
+        """The mkdir -p posture every leaf refusal has: the caller asked for the
+        parent path by name, so those segments persist and are NAMED rather than
+        silently left behind — this server cannot delete a folder."""
+        posts: list[dict] = []
+
+        def _post(path: str, body: dict, **kw: object) -> dict:
+            posts.append(body)
+            if "project_dir" in body:
+                return {"error": "Project directory must be an existing directory"}
+            return {
+                "id": f"new{len(posts):09d}",
+                "name": body["name"],
+                "parent_id": body["parent_id"],
+            }
+
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._post", side_effect=_post),
+        ):
+            out = _call_tool_inner(
+                "chat_folder_create",
+                {"name": "leaf", "parent": "Fresh", "project_dir": "/nope/missing"},
+            )
+        assert out.startswith("Error: Project directory must be an existing directory")
+        assert "(created parent path: Fresh)" in out
+        # The path never reached the parent segment's create.
+        assert "project_dir" not in posts[0]
+
+    def test_an_overlong_project_dir_is_refused_by_the_schema(self) -> None:
+        """PATH_MAX-bounded at the tool layer, like ``set_project``."""
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._post") as mock_post,
+        ):
+            with pytest.raises(ValidationError):
+                _call_tool_inner(
+                    "chat_folder_create", {"name": "Long", "project_dir": "/" + "p" * 4096}
+                )
+        mock_post.assert_not_called()
+
+    def test_the_tool_advertises_project_dir_and_still_requires_only_name(self) -> None:
+        tool = next(t for t in _list_tools() if t["name"] == "chat_folder_create")
+        assert set(tool["inputSchema"]["properties"]) == {"name", "parent", "project_dir"}
+        assert tool["inputSchema"]["required"] == ["name"]
+        # The description tells the agent what the binding does and where the
+        # rules live -- both halves are what a caller needs to use it well.
+        assert "inherits it at creation" in tool["description"]
+        assert "chat_folder_update" in tool["description"]
+        assert "sensitive" in tool["inputSchema"]["properties"]["project_dir"]["description"]
+
+
+class TestFolderUpdate:
+    """``chat_folder_update`` sets or clears an EXISTING folder's project directory.
+
+    One PATCH to the route the sidebar's Folder settings use, carrying the one
+    field this tool changes. The endpoint owns validation and the ownership fence
+    (an app or crew member may change only a folder it created); the tool
+    resolves the folder reference the way the sibling folder verbs do and
+    surfaces the endpoint's verdict rather than pre-judging it.
+    """
+
+    def test_sets_project_dir_on_a_folder_named_by_path(self) -> None:
+        updated = {
+            "id": "bbbbbbbbbbbb",
+            "name": "0811",
+            "parent_id": "aaaaaaaaaaaa",
+            "project_dir": "/srv/projects/0811",
+        }
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._patch", return_value=updated) as mock_patch,
+        ):
+            out = _call_tool_inner(
+                "chat_folder_update",
+                {"folder": "kirocrew/0811", "project_dir": "/srv/projects/0811"},
+            )
+        path, body = mock_patch.call_args.args
+        assert path == "/api/chat/folders/bbbbbbbbbbbb"
+        assert body == {"project_dir": "/srv/projects/0811"}
+        assert mock_patch.call_args.kwargs["session_key"] == "dashboard:chat-1-100"
+        assert "Set the project directory of `kirocrew/0811`" in out
+        assert "/srv/projects/0811" in out
+        assert "picks it up on its next agent switch" in out
+
+    def test_accepts_the_folder_by_id(self) -> None:
+        updated = {"id": "cccccccccccc", "name": "Travel", "parent_id": "", "project_dir": "/t"}
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._patch", return_value=updated) as mock_patch,
+        ):
+            out = _call_tool_inner(
+                "chat_folder_update", {"folder": "cccccccccccc", "project_dir": "/t"}
+            )
+        assert mock_patch.call_args.args[0] == "/api/chat/folders/cccccccccccc"
+        assert "`Travel`" in out
+
+    def test_an_empty_string_clears_the_binding(self) -> None:
+        """The endpoint's own 'clear' spelling: ``project_dir: ""``."""
+        cleared = {"id": "cccccccccccc", "name": "Travel", "parent_id": "", "project_dir": ""}
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._patch", return_value=cleared) as mock_patch,
+        ):
+            out = _call_tool_inner("chat_folder_update", {"folder": "Travel", "project_dir": ""})
+        assert mock_patch.call_args.args[1] == {"project_dir": ""}
+        assert out.startswith("Cleared the project directory of `Travel`")
+
+    def test_a_null_project_dir_is_the_same_clear_as_the_empty_string(self) -> None:
+        """``project_dir: null`` is the ONE clear form spelled the other way. The
+        schema hands a JSON null through as ``None`` (the non-required field's
+        default, and the custom validator only tests key presence), so the
+        handler must not stringify it: ``str(None)`` is the literal ``"None"``,
+        which the PATCH would carry as a directory name."""
+        cleared = {"id": "cccccccccccc", "name": "Travel", "parent_id": "", "project_dir": ""}
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._patch", return_value=cleared) as mock_patch,
+        ):
+            out = _call_tool_inner("chat_folder_update", {"folder": "Travel", "project_dir": None})
+        assert mock_patch.call_args.args[1] == {"project_dir": ""}
+        assert out.startswith("Cleared the project directory of `Travel`")
+
+    def test_the_advertised_schema_admits_the_null_clear(self) -> None:
+        """The documented ``null`` clear has to survive validation against the
+        tool's OWN advertised ``inputSchema`` -- the fail-closed check the
+        gateway's app-call path (and any schema-enforcing client) runs BEFORE
+        the handler sees the call. With ``"type": "string"`` alone that check
+        refuses ``null`` as ``expected string, got NoneType`` and the clear form
+        the description promises is unreachable through the MCP call."""
+        tool = next(t for t in _list_tools() if t["name"] == "chat_folder_update")
+        args = {"folder": "Travel", "project_dir": None}
+        validate_mcp_tool_arguments(args, tool["inputSchema"])
+        cleared = {"id": "cccccccccccc", "name": "Travel", "parent_id": "", "project_dir": ""}
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._patch", return_value=cleared) as mock_patch,
+        ):
+            out = _call_tool_inner("chat_folder_update", args)
+        assert mock_patch.call_args.args[1] == {"project_dir": ""}
+        assert out.startswith("Cleared the project directory of `Travel`")
+        # The string forms still validate under the widened type, so the
+        # widening admits null and nothing else.
+        validate_mcp_tool_arguments({"folder": "Travel", "project_dir": ""}, tool["inputSchema"])
+        validate_mcp_tool_arguments({"folder": "Travel", "project_dir": "/t"}, tool["inputSchema"])
+        with pytest.raises(ValidationError):
+            validate_mcp_tool_arguments({"folder": "Travel", "project_dir": 7}, tool["inputSchema"])
+
+    def test_a_missing_project_dir_is_refused_by_the_schema_before_any_read(self) -> None:
+        """The verb's one settable field is required. ``required=True`` would
+        also refuse the ``""`` clear spelling, so the schema carries the rule
+        as a custom validator (the ``set_project.path`` idiom); it fires before
+        the handler touches the folder store."""
+        with (
+            patch("kiro_crew.mcp_dashboard._get") as mock_get,
+            patch("kiro_crew.mcp_dashboard._patch") as mock_patch,
+        ):
+            with pytest.raises(ValidationError) as excinfo:
+                _call_tool_inner("chat_folder_update", {"folder": "Travel"})
+        assert "project_dir" in str(excinfo.value) and "'' to clear" in str(excinfo.value)
+        mock_get.assert_not_called()
+        mock_patch.assert_not_called()
+
+    def test_root_is_not_a_folder(self) -> None:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._patch") as mock_patch,
+        ):
+            out = _call_tool_inner("chat_folder_update", {"folder": "root", "project_dir": "/t"})
+        assert out.startswith("Error:") and "'root' is not a folder" in out
+        mock_patch.assert_not_called()
+
+    def test_an_unknown_folder_writes_nothing(self) -> None:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._patch") as mock_patch,
+        ):
+            out = _call_tool_inner(
+                "chat_folder_update", {"folder": "Nowhere/Deep", "project_dir": "/t"}
+            )
+        assert out.startswith("Error:") and "folder not found" in out
+        mock_patch.assert_not_called()
+
+    def test_an_ambiguous_path_writes_nothing(self) -> None:
+        dup = [*_FOLDERS, {"id": "dddddddddddd", "name": "0811", "parent_id": "aaaaaaaaaaaa"}]
+
+        def _get(path: str) -> list[dict]:
+            return [dict(f) for f in dup] if path == "/api/chat/folders" else _rows(path)
+
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_get),
+            patch("kiro_crew.mcp_dashboard._patch") as mock_patch,
+        ):
+            out = _call_tool_inner(
+                "chat_folder_update", {"folder": "kirocrew/0811", "project_dir": "/t"}
+            )
+        assert out.startswith("Error:") and "pass the folder id" in out
+        mock_patch.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "refusal",
+        [
+            "project_dir refers to a sensitive path",
+            "Project directory must be an existing directory",
+        ],
+    )
+    def test_the_endpoints_path_refusal_is_surfaced_verbatim(self, refusal: str) -> None:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._patch", return_value={"error": refusal}),
+        ):
+            out = _call_tool_inner(
+                "chat_folder_update", {"folder": "Travel", "project_dir": "/home/me/.ssh"}
+            )
+        assert out == f"Error: {refusal}"
+
+    def test_the_endpoints_principal_refusal_is_surfaced_not_reinvented(self) -> None:
+        """A crew member may not change an existing folder's binding; the
+        endpoint decides that and this layer reports its verdict, adding the one
+        static hint the endpoint's text does not carry: the tool that IS open to
+        a member. The member's slot carries no app, which is how the tool tells
+        it from an app caller (below)."""
+        denied = {
+            "error": (
+                "a crew member cannot change an existing folder's project "
+                "directory - bind it when creating the folder, or ask the person"
+            ),
+            "code": "folder_project_dir_forbidden",
+        }
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._patch", return_value=denied) as mock_patch,
+        ):
+            out = _call_tool_inner("chat_folder_update", {"folder": "Travel", "project_dir": "/t"})
+        assert out.startswith("Error:") and "cannot change an existing folder's project" in out
+        assert "chat_folder_create with project_dir" in out
+        # The write REACHED the endpoint under the verified key -- the tool did
+        # not decide the policy itself.
+        assert mock_patch.call_args.kwargs["session_key"] == "dashboard:chat-1-100"
+
+    def test_an_apps_principal_refusal_carries_no_create_hint(self) -> None:
+        """An app is refused a binding at create as well, so the hint naming
+        chat_folder_create would send it to a second refusal: the endpoint's
+        own words are the whole answer."""
+        denied = {
+            "error": "an app cannot set or clear a folder's project directory - ask the person",
+            "code": "folder_project_dir_forbidden",
+        }
+
+        def _mixed(path: str) -> list[dict]:
+            if path == "/api/chat/folders":
+                return [dict(f) for f in _FOLDERS]
+            return [
+                {"key": "chat-1-100", "title": "Radar run", "folder_id": "", "app": "issue-radar"}
+            ]
+
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_mixed),
+            patch("kiro_crew.mcp_dashboard._patch", return_value=denied) as mock_patch,
+        ):
+            out = _call_tool_inner("chat_folder_update", {"folder": "Travel", "project_dir": "/t"})
+        assert out == f"Error: {denied['error']}"
+        assert "chat_folder_create" not in out
+        # The write REACHED the endpoint under the app's verified key.
+        assert mock_patch.call_args.kwargs["session_key"] == "dashboard:chat-1-100"
+
+    def test_a_channel_refusal_on_a_dashboard_key_carries_no_create_hint(self) -> None:
+        """A dashboard-born slot linked to a Slack thread keeps its
+        ``dashboard:<slot>`` key and carries no app, so nothing THIS layer can
+        read tells it from a crew member -- only the endpoint, which reads the
+        gateway-owned link, can. It answers with the channel arm's text, and a
+        hint pointing at chat_folder_create would send the caller to a second
+        refusal (the create is fenced for it too). So the hint keys on the
+        endpoint's verdict -- the member arm's own "bind it when creating" --
+        not on a client-side re-derivation of who is calling."""
+        denied = {
+            "error": (
+                "a channel agent cannot set or clear a folder's project directory - "
+                "ask the person"
+            ),
+            "code": "folder_project_dir_forbidden",
+        }
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._patch", return_value=denied) as mock_patch,
+        ):
+            out = _call_tool_inner("chat_folder_update", {"folder": "Travel", "project_dir": "/t"})
+        assert out == f"Error: {denied['error']}"
+        assert "chat_folder_create" not in out
+        assert mock_patch.call_args.kwargs["session_key"] == "dashboard:chat-1-100"
+
+    def test_the_tool_says_an_existing_folders_binding_is_the_persons(self) -> None:
+        tool = next(t for t in _list_tools() if t["name"] == "chat_folder_update")
+        assert "cannot set or clear the binding of an EXISTING folder" in tool["description"]
+        assert "chat_folder_create with project_dir" in tool["description"]
+        create = next(t for t in _list_tools() if t["name"] == "chat_folder_create")
+        assert (
+            "binds only at create"
+            in create["inputSchema"]["properties"]["project_dir"]["description"]
+        )
+
+    def test_the_tools_say_a_channel_agent_never_binds_and_a_move_keeps_the_binding(
+        self,
+    ) -> None:
+        """The rules the endpoint enforces beside the create-only one -- a channel
+        agent is refused a binding on all three paths, and an agent principal's
+        move may not change what the moved subtree inherits, binding or steering
+        -- are stated where the agent reads them, on all three tools involved,
+        and "channel agent" is defined there to cover a session driven from a
+        messaging channel (a ``slack:``/``discord:`` key), which the endpoint
+        fences the same way."""
+        by_name = {t["name"]: t for t in _list_tools()}
+        for name in ("chat_folder_create", "chat_folder_update", "chat_folder_move"):
+            assert "channel agent" in by_name[name]["description"], name
+            assert "messaging channel" in by_name[name]["description"], name
+        assert "inherit a DIFFERENT project directory" in by_name["chat_folder_move"]["description"]
+        assert "DIFFERENT steering directories" in by_name["chat_folder_move"]["description"]
+        assert "chat_folder_move" in by_name["chat_folder_update"]["description"]
+
+    def test_an_unverifiable_caller_is_refused_without_a_write(self) -> None:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value=""),
+            patch("kiro_crew.mcp_dashboard._patch") as mock_patch,
+        ):
+            out = _call_tool_inner("chat_folder_update", {"folder": "Travel", "project_dir": "/t"})
+        assert out.startswith("Error:")
+        assert "cannot verify which session is calling" in out
+        mock_patch.assert_not_called()
+
+    def test_a_delegated_caller_is_refused_without_a_write(self) -> None:
+        """A subagent runs on behalf of whatever created it, so it cannot be
+        granted more than that -- the same rule every tree-shaping verb applies."""
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch(
+                "kiro_crew.mcp_core._resolve_session_key_strict",
+                return_value="subagent:abc123",
+            ),
+            patch("kiro_crew.mcp_dashboard._patch") as mock_patch,
+        ):
+            out = _call_tool_inner("chat_folder_update", {"folder": "Travel", "project_dir": "/t"})
+        assert out.startswith("Error:") and "subagent or a scheduled job" in out
+        mock_patch.assert_not_called()
+
+    def test_the_tool_declares_folder_and_project_dir_only(self) -> None:
+        tool = next(t for t in _list_tools() if t["name"] == "chat_folder_update")
+        assert set(tool["inputSchema"]["properties"]) == {"folder", "project_dir"}
+        assert tool["inputSchema"]["required"] == ["folder", "project_dir"]
+        assert "'' to clear" in tool["inputSchema"]["properties"]["project_dir"]["description"]
+        assert "null clears" in tool["inputSchema"]["properties"]["project_dir"]["description"]
+        assert "sensitive" in tool["description"]
+        # The claim about sessions already filed in the folder must match what
+        # ``api_chat_slot_agent`` does: it re-resolves the folder binding on every
+        # agent switch, so those sessions are not "untouched" -- they follow on
+        # their next switch, and only ``set_project`` re-scopes one at once.
+        assert "picks up the folder's current binding on its next agent switch" in (
+            tool["description"]
+        )
+        assert "untouched" not in tool["description"]
+
+    def test_default_agent_is_not_a_field_of_this_verb(self) -> None:
+        """The verb changes ONE binding. Any other folder field is refused by the
+        schema rather than silently dropped, so a caller learns the surface."""
+        with pytest.raises(ValidationError):
+            _call_tool_inner(
+                "chat_folder_update", {"folder": "Travel", "default_agent": "kirocrew-worker"}
+            )
+
+    def test_an_overlong_project_dir_is_refused_by_the_schema(self) -> None:
+        with pytest.raises(ValidationError):
+            _call_tool_inner(
+                "chat_folder_update", {"folder": "Travel", "project_dir": "/" + "p" * 4096}
+            )
+
+
+class TestAUncProjectDirNeverLeavesTheTool:
+    """The endpoint owns the UNC refusal (``_validate_project_dir``); the tool runs
+    the SAME lexical check, through the same helper, before it posts, so an agent
+    that names ``\\\\host\\share`` gets the endpoint's own refusal without a
+    round trip and the text never reaches the gateway at all. Path text is
+    untrusted on every host, so the pre-check reads no platform. A plain absolute
+    path and the ``""`` clear still travel exactly as before.
+    """
+
+    UNC = (r"\\evil\share\proj", "//evil/share/proj", r"\\?\UNC\evil\share\proj")
+    REFUSAL = "Error: Project directory must not be a network (UNC) path"
+
+    @pytest.mark.parametrize("unc", UNC)
+    @pytest.mark.parametrize("platform", ["linux", "win32"])
+    def test_create_refuses_it_without_posting(self, monkeypatch, unc, platform) -> None:
+        import sys
+
+        import kiro_crew.dashboard.chat_folders as cf
+
+        monkeypatch.setattr(sys, "platform", platform)
+        monkeypatch.setattr(cf, "unc_probe_allowed", lambda raw: False)
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows) as mock_get,
+            patch("kiro_crew.mcp_dashboard._post") as mock_post,
+        ):
+            out = _call_tool_inner(
+                "chat_folder_create", {"name": "Share", "parent": "New", "project_dir": unc}
+            )
+        assert out == self.REFUSAL
+        # Before the parent walk too: the folder tree is never read (only the
+        # identity gate's slot read ran), so no parent segment is created.
+        assert [c.args[0] for c in mock_get.call_args_list] == ["/api/chat/slots"]
+        mock_post.assert_not_called()
+
+    @pytest.mark.parametrize("unc", UNC)
+    @pytest.mark.parametrize("platform", ["linux", "win32"])
+    def test_update_refuses_it_without_patching(self, monkeypatch, unc, platform) -> None:
+        import sys
+
+        import kiro_crew.dashboard.chat_folders as cf
+
+        monkeypatch.setattr(sys, "platform", platform)
+        monkeypatch.setattr(cf, "unc_probe_allowed", lambda raw: False)
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._patch") as mock_patch,
+        ):
+            out = _call_tool_inner("chat_folder_update", {"folder": "Travel", "project_dir": unc})
+        assert out == self.REFUSAL
+        mock_patch.assert_not_called()
+
+    def test_a_plain_path_and_the_clear_still_travel(self) -> None:
+        made = {"id": "dddddddddddd", "name": "Share", "parent_id": "", "project_dir": "/srv/p"}
+        cleared = {"id": "cccccccccccc", "name": "Travel", "parent_id": "", "project_dir": ""}
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._post", return_value=made) as mock_post,
+            patch("kiro_crew.mcp_dashboard._patch", return_value=cleared) as mock_patch,
+        ):
+            _call_tool_inner("chat_folder_create", {"name": "Share", "project_dir": "/srv/p"})
+            _call_tool_inner("chat_folder_update", {"folder": "Travel", "project_dir": ""})
+        assert mock_post.call_args.args[1]["project_dir"] == "/srv/p"
+        assert mock_patch.call_args.args[1] == {"project_dir": ""}
 
 
 class TestAmbiguousFolderPaths:
@@ -1820,6 +2356,7 @@ class TestAdvertisedSet:
         assert names == {
             "chat_folder_tree",
             "chat_folder_create",
+            "chat_folder_update",
             "chat_folder_move",
             "chat_folder_move_session",
             "chat_folder_file_self",

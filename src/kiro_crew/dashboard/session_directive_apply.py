@@ -57,6 +57,7 @@ from kiro_crew.autonudge import (
     MONITOR_TERMINAL_REASON,
     is_channel_key,
 )
+from kiro_crew.dashboard.chat_folders import project_dir_unc_refusal
 from kiro_crew.messaging.link import is_channel_session_key
 from kiro_crew.probes.gh_pr import wake_set_phrase
 from kiro_crew.session_surface import has_dashboard_surface
@@ -1066,6 +1067,17 @@ async def _set_project(state: Any, slot: Any, args: dict[str, Any]) -> str:
             slot._pending_reset_history_key = effective_session_key(slot)
         _push(state)
         return "Project cleared. The next message cold-starts with no project scope."
+    # Lexical, before ``expanduser`` and the worker-thread ``realpath``: a
+    # UNC-shaped project (``\\host\share``, ``//host/share``) makes a Windows
+    # gateway's ``realpath`` open an SMB connection to a host the agent named
+    # -- an outbound credential probe with no recovery. The folder endpoint's
+    # own helper decides (one rule for every site where agent-authored path
+    # text is admitted: the folder routes, this directive, the slot project
+    # endpoint), on every host; a permission decision, so it raises and the
+    # wrapper audits it as denied.
+    unc_err = project_dir_unc_refusal(project)
+    if unc_err:
+        raise _DirectiveDenied(f"Error: {unc_err}.")
     expanded = os.path.expanduser(project)
 
     def _validate() -> tuple[str, bool, bool]:

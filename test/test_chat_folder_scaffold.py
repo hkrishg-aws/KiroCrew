@@ -319,6 +319,32 @@ class TestScanRootValidation:
         assert body["code"] == "folder_scan_root_invalid"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "unc", [r"\\evil\share\proj", "//evil/share/proj", r"\\?\UNC\evil\share\proj"]
+    )
+    async def test_unc_root_rejected_before_any_filesystem_call(
+        self, state: Any, monkeypatch: pytest.MonkeyPatch, unc: str
+    ) -> None:
+        """The scan root is request-named path text reaching ``realpath`` and a
+        directory walk, so it goes through the folder API's ADMISSION validator
+        (``_admit_project_dir``): a UNC shape is refused lexically, same wording,
+        before the filesystem is touched -- on a Windows gateway ``realpath`` on
+        ``\\\\host\\share`` would contact that host."""
+        monkeypatch.setattr("kiro_crew.dashboard.chat_folders.unc_probe_allowed", lambda raw: False)
+        touched = mock.MagicMock(
+            side_effect=AssertionError("filesystem touched for a UNC scan root")
+        )
+        monkeypatch.setattr("os.path.realpath", touched)
+        monkeypatch.setattr("os.path.isdir", touched)
+        async with TestClient(TestServer(_make_scaffold_app(state))) as client:
+            status, body = await _scan(client, unc)
+
+        assert status == 400
+        assert body["error"] == "Project directory must not be a network (UNC) path"
+        assert body["code"] == "folder_scan_root_invalid"
+        touched.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_absent_root_field_rejected(self, state: Any) -> None:
         """An empty root is caller error, not a scan of nothing."""
 

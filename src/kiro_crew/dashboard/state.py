@@ -2487,6 +2487,7 @@ class _ChatSlot:
         "_slack_linked",
         "_slack_channel",
         "_slack_thread_ts",
+        "_active_turn_channel_origin",
         "channel_origin",
         "_channel_runtime_origin",
         "folder_id",
@@ -3037,6 +3038,15 @@ class _ChatSlot:
         self._slack_linked: bool = False  # True when linked to a Slack thread
         self._slack_channel: str = ""
         self._slack_thread_ts: str = ""
+        # The channel principal (``slack:<ts>``) of the turn RUNNING on this
+        # slot when a channel produced it, else "". Published by ``_run_chat``
+        # at turn start beside ``_active_turn_session_key`` and retired with it,
+        # so the folder fences (``chat_folders._linked_thread_principal``) read
+        # who produced the running turn from a snapshot the turn owns: the link
+        # above is mutable underneath a turn -- the unlink route and a thread
+        # handoff clear it -- and read live it relabelled a thread-driven turn
+        # as the person mid-turn.
+        self._active_turn_channel_origin: str = ""
         self.folder_id: str = ""  # project folder assignment
         self._folder_changed: bool = False  # re-inject [FOLDER] breadcrumb next turn after move
         # One-shot claim for the post-titling folder suggestion (see

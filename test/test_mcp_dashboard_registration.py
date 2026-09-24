@@ -335,6 +335,11 @@ class TestWhatThisSetGrants:
     FOLDER_TOOLS = {
         "chat_folder_tree",
         "chat_folder_create",
+        # Sets or clears ONE folder field, the project directory, and nothing
+        # else -- the same no-delete posture as the rest: it cannot lose a
+        # conversation, and the endpoint's ownership fence bounds it to folders
+        # the caller created.
+        "chat_folder_update",
         "chat_folder_move",
         "chat_folder_move_session",
         "chat_folder_file_self",

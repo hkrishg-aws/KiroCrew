@@ -556,6 +556,39 @@ class TestApplierAuditAndFailSoft:
         assert slot.project == "/existing"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "unc", [r"\\evil\share\proj", "//evil/share/proj", r"\\?\UNC\evil\share\proj"]
+    )
+    async def test_a_unc_project_is_refused_before_any_filesystem_probe(
+        self, monkeypatch, sel_spy, unc
+    ):
+        """``set_project`` is agent-authored path text reaching ``realpath``: on a
+        Windows gateway a UNC-shaped value makes that call open an SMB connection
+        to the named host. The directive runs the folder endpoint's own lexical
+        UNC refusal (one helper, every admission site) before ``realpath`` or
+        ``isdir``, on every host; audited denied; the slot is not repointed."""
+        monkeypatch.setattr("kiro_crew.dashboard.chat_folders.unc_probe_allowed", lambda raw: False)
+        probed: list[str] = []
+
+        def _probe(p, **kw):
+            probed.append(p)
+            return p
+
+        monkeypatch.setattr("os.path.realpath", _probe)
+        monkeypatch.setattr("os.path.isdir", lambda p: probed.append(p) or False)
+        slot = _FakeSlot(project="/existing")
+        state = _FakeState()
+        result = await apply_session_directive(
+            state, slot, "dashboard:chat-1", "set_project",
+            {"project": unc, "clear": False},
+            producer_is_user_facing=True,
+        )
+        assert result == "Error: Project directory must not be a network (UNC) path."
+        assert probed == [], f"UNC path reached the filesystem before the refusal: {probed!r}"
+        assert [c["outcome"] for c in sel_spy.calls] == ["denied"]
+        assert slot.project == "/existing"
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("kind", ["suggest_followup", "ask_question"])
     @pytest.mark.parametrize("session_key", ["cron:job-abc", "slack:C123.456", "sub:agent-1", ""])
     async def test_slot_targeting_directives_are_dashboard_only(

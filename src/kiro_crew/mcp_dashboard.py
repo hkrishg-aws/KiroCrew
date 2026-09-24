@@ -19,8 +19,9 @@ every tool in it. That is the unit to keep in mind when adding one — a capabil
 that must be grantable separately belongs in a server of its own.
 
 What it controls today is the chat (sidebar) folder tree: read it, create a
-folder, reparent a folder, and file a live session into one. Create and move
-only — no delete and no rename, so nothing here can lose a conversation. It also
+folder, reparent a folder, bind a folder to a project directory (or unbind it),
+and file a live session into one. Create, move and that one binding only — no
+delete and no rename, so nothing here can lose a conversation. It also
 controls session TAGS with the same posture: read the vocabulary, create or
 update a tag (rename, recolor, status flag), and add or remove tags on a live
 session — no tag delete, so nothing here can strip a label from every session
@@ -80,6 +81,7 @@ from urllib.parse import quote
 from kiro_crew.dashboard.chat_folders import (
     _folder_owner_app,
     _subtree_holds_foreign_folder,
+    project_dir_unc_refusal,
 )
 from kiro_crew.mcp_core import (
     _get,
@@ -97,6 +99,7 @@ from kiro_crew.validation import (
     CHAT_FOLDER_MOVE_SCHEMA,
     CHAT_FOLDER_MOVE_SESSION_SCHEMA,
     CHAT_FOLDER_TREE_SCHEMA,
+    CHAT_FOLDER_UPDATE_SCHEMA,
     CHAT_TAG_ASSIGN_SCHEMA,
     CHAT_TAG_CREATE_SCHEMA,
     CHAT_TAG_LIST_SCHEMA,
@@ -178,11 +181,32 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "chat_folder_tree; missing path segments are created too (mkdir -p). "
                 "Omit ``parent`` (or pass 'root') for a top-level folder. Creating a "
                 "folder never moves anything — file sessions into it with "
-                "chat_folder_move_session. An app agent may create at the top level "
-                "or inside a folder it created itself, and the new folder belongs to "
-                "it; creating inside one of the person's folders is refused. A crew "
-                "member follows the same rule: it owns the folders it creates and "
-                "may nest only under its own."
+                "chat_folder_move_session. Optional ``project_dir`` binds the new "
+                "folder to a project directory: a chat the person opens inside the "
+                "folder inherits it at creation and starts scoped to that project — "
+                "its ``.kiro/steering`` and repo-scoped lessons — which no later step "
+                "can add without tearing the session down (set_project). The path is "
+                "validated by the same rule the sidebar's Folder settings apply: an "
+                "absolute path to an existing directory, never a sensitive location "
+                "(~/.aws, ~/.ssh and the like). An invalid path refuses the folder with "
+                "the endpoint's own error; parent segments this call created on the "
+                "way persist and are named in the result. Set or clear it later with "
+                "chat_folder_update. "
+                "An app agent may create at the top level or inside a folder it "
+                "created itself, and the new folder belongs to it; creating inside "
+                "one of the person's folders is refused. A crew member follows the "
+                "same rule: it owns the folders it creates and may nest only under "
+                "its own; a binding a crew member sets here reaches only chats running "
+                "AS the member (its own workers), never the person's chat filed in the "
+                "member's folder — that chat inherits the nearest binding of the "
+                "person's own above it, or the workspace default. An app agent cannot "
+                "bind a folder at all. A channel agent (a Channels session, a session "
+                "driven from "
+                "a messaging channel such as Slack or Discord, or a dashboard session "
+                "linked to a Slack thread) cannot bind a folder at "
+                "all -- with project_dir the create is refused -- because a binding "
+                "decides the project of the person's chats and a channel agent acts on "
+                "words from a thread other people are in."
             ),
             "inputSchema": {
                 "type": "object",
@@ -198,8 +222,91 @@ def _tool_definitions() -> list[dict[str, Any]]:
                         "type": "string",
                         "description": "Parent folder id or human path. Omit / 'root' for top level.",
                     },
+                    "project_dir": {
+                        "type": "string",
+                        "description": (
+                            "Absolute path of an existing directory to bind the folder "
+                            "to (a chat opened inside the folder inherits it). Validated "
+                            "by the folder endpoint: sensitive locations (~/.aws, ~/.ssh "
+                            "and the like) are refused. The stored path is re-checked "
+                            "every time a chat is opened in the folder, so bind a "
+                            "directory that outlives the folder, not a scratch or "
+                            "worktree path: while it is missing, opening a chat there is "
+                            "refused until chat_folder_update fixes or clears the "
+                            "binding (the person's verb for an existing folder: a crew "
+                            "member binds only at create, and an app agent cannot bind a "
+                            "folder at all -- a chat filed in an app's folder inherits no "
+                            "project directory). Omit for no binding."
+                        ),
+                    },
                 },
                 "required": ["name"],
+            },
+        },
+        {
+            "name": "chat_folder_update",
+            "description": (
+                "Set or clear the project directory of an EXISTING sidebar folder. "
+                "``folder`` is a folder id or '/'-separated human path from "
+                "chat_folder_tree (same resolution as chat_folder_move). "
+                "``project_dir`` is an absolute path to an existing directory; pass "
+                "an empty string to clear the binding (a JSON null is read as the same "
+                "clear). Validation is the folder "
+                "endpoint's own — the rule the sidebar's Folder settings apply: "
+                "sensitive locations (~/.aws, ~/.ssh and the like) are refused, and a "
+                "refused path changes nothing. The binding is read when a chat is "
+                "OPENED in the folder afterwards: it inherits the directory at creation "
+                "and starts scoped to that project — and the stored path is re-checked "
+                "each time, so while a bound directory is missing every new chat in the "
+                "folder is refused until this tool fixes or clears the binding. "
+                "Sessions already filed there are not re-scoped by this call: a filed "
+                "session picks up the folder's current binding on its next agent switch "
+                "(the switch re-resolves the folder's directory), and set_project is the "
+                "immediate path, which tears the session down. Metadata only: no session, "
+                "transcript or folder "
+                "placement moves. Ownership: this verb is the PERSON's. An app agent or "
+                "a crew member cannot set or clear the binding of an EXISTING folder at "
+                "all — not even one it created that holds only its own folders — "
+                "because every session filed in the folder's subtree, live or in "
+                "History, picks the binding up on its next agent switch, and the folder "
+                "store cannot see those sessions atomically. A crew member binds a "
+                "folder when it CREATES it (chat_folder_create with project_dir), while "
+                "nothing is filed in it yet, and that binding reaches only chats running "
+                "AS the member — its own workers — never the person's chat filed in the "
+                "member's folder, which inherits the nearest binding of the person's own "
+                "above it or the workspace default; an app agent cannot bind a folder at "
+                "all, at create "
+                "or here, and a chat filed in an app's folder inherits no project "
+                "directory (nor does a folder beneath it inherit what the app's folder "
+                "stores); changing a binding afterwards is the person's, and so is "
+                "moving a folder to where its sessions would inherit a different "
+                "directory (see chat_folder_move). A channel agent (a Channels session, "
+                "a session driven from a messaging channel such as Slack or Discord, or "
+                "a dashboard session linked to a Slack thread) "
+                "cannot set or clear a binding at all, here or at create, and is held "
+                "to the same rule on a move."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "folder": {
+                        "type": "string",
+                        "description": "Folder to change (id or human path).",
+                    },
+                    "project_dir": {
+                        # ``null`` is the documented second spelling of the clear, so
+                        # the advertised type must admit it: the gateway's app-call
+                        # path validates arguments against THIS schema, fail-closed,
+                        # before the handler runs, and a schema-enforcing client does
+                        # the same.
+                        "type": ["string", "null"],
+                        "description": (
+                            "Absolute path of an existing directory, or '' to clear "
+                            "the folder's project directory (null clears it the same way)."
+                        ),
+                    },
+                },
+                "required": ["folder", "project_dir"],
             },
         },
         {
@@ -220,7 +327,31 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "the anchor. An app agent may move only a folder it created itself, "
                 "and only to the top level or under another of its own; positioning "
                 "is refused outright when it would renumber siblings the app does "
-                "not own. A crew member is bound by the same own-folders-only rule."
+                "not own. A crew member is bound by the same own-folders-only rule. "
+                "A crew member may not move a folder to where the sessions filed in it "
+                "would inherit a DIFFERENT project directory (an unbound folder resolves "
+                "its nearest bound ancestor, so moving it under a folder bound at "
+                "create, or out from under one, would rebind the person's chats filed "
+                "inside it): an unbound folder moves only between places with the same "
+                "inherited binding; a folder the PERSON bound moves freely (its binding "
+                "reaches every chat, so its subtree resolves it wherever it sits); a "
+                "folder a crew member bound at create moves only where the OTHER chats "
+                "filed in it keep resolving the same ancestor binding, because the "
+                "member's binding stops only the member's own chats. An "
+                "app's move is not held to that rule -- a chat filed in an app's folder "
+                "resolves no binding wherever the folder sits, so no move of the app's "
+                "own folders changes what any chat resolves. "
+                "Neither an app nor a crew member may move a folder to where those "
+                "sessions would inherit "
+                "DIFFERENT steering directories: a folder's steering_dirs are read into "
+                "every chat filed beneath it, accumulating up the parent chain, so a "
+                "move under a folder that declares them, or out from under one, is "
+                "refused the way declaring them is. "
+                "A channel agent (a Channels session, a session driven from a "
+                "messaging channel such as Slack or Discord, or a dashboard session "
+                "linked to a Slack thread) may move the person's "
+                "folders but is held to those same rules: it cannot move one across a "
+                "binding or across declared steering either."
             ),
             "inputSchema": {
                 "type": "object",
@@ -1929,6 +2060,19 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
                 "identically to a nested path and become unaddressable by path. "
                 "Create the parent and child separately, or use a different name."
             )
+        # A UNC-shaped ``project_dir`` names a HOST: on a Windows gateway the
+        # endpoint's own ``realpath`` would open an SMB connection to it, so the
+        # endpoint refuses the shape lexically before any filesystem call. This
+        # tool runs the endpoint's own helper first -- before the parent walk
+        # below creates anything -- so the text never travels, no segment is
+        # made for a folder that cannot exist, and the agent reads the
+        # endpoint's own words without a round trip. Pure string work: it reads
+        # no disk and no platform, so it holds in this sandboxed process.
+        requested_project_dir = str(args.get("project_dir") or "").strip()
+        if requested_project_dir:
+            unc_err = project_dir_unc_refusal(requested_project_dir)
+            if unc_err:
+                return f"Error: {unc_err}"
         chat_folders, folders_err = _get_rows("/api/chat/folders")
         if folders_err:
             return f"Error: {folders_err}"
@@ -1960,6 +2104,24 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
                 "characters or fewer"
             )
         body = {"name": safe_name, "parent_id": parent_id}
+        # ``project_dir`` rides the SAME POST the sidebar's own create sends, so
+        # the endpoint validates it (``_validate_project_dir`` plus the
+        # workspace-overlap guard) and refuses the folder with its own error
+        # text — nothing here re-implements the FILESYSTEM checks. Deliberately
+        # not pre-flighted on disk in this process either: the kiro-cli
+        # subprocess tree this server runs in is sandboxed (``sandbox.py``
+        # bind-mounts credential paths away), so a filesystem check here would
+        # not see what the gateway sees and could refuse a directory the
+        # endpoint accepts. The cost is the mkdir -p posture every leaf refusal
+        # already has: parent segments created on the way persist and are named
+        # in ``made_note``. The ONE pre-check is lexical and already ran above,
+        # before the parent walk: a UNC-shaped value was refused by
+        # ``project_dir_unc_refusal`` -- the endpoint's own helper -- so the
+        # text reaching this line names no host.
+        # Sent only when non-empty so a call without it posts exactly the body
+        # it always did.
+        if requested_project_dir:
+            body["project_dir"] = requested_project_dir
         # The verified key is passed through unchanged: re-resolving inside the
         # helper would let the write carry a different session's authority than
         # the one the gate checked, and the endpoint's ownership rule is only as
@@ -1970,7 +2132,96 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         chat_folders.append(d)
         new_id = str(d.get("id") or "?")
         new_path = _chat_folder_paths(chat_folders).get(new_id) or str(d.get("name") or "?")
-        return redact(f"Created folder `{new_path}` (id={new_id}).{made_note}")
+        # Report the STORED path, not the requested one: the endpoint expands
+        # ``~`` and resolves symlinks, and the stored form is what a session
+        # created in the folder will inherit.
+        bound = f" Project directory: {d['project_dir']}." if d.get("project_dir") else ""
+        return redact(f"Created folder `{new_path}` (id={new_id}).{bound}{made_note}")
+
+    if name == "chat_folder_update":
+        args = validate_tool_args(args, CHAT_FOLDER_UPDATE_SCHEMA)
+        caller_key, caller_app, gate = _refuse_tree_shaping_if_unverifiable(
+            "changing a folder's project directory"
+        )
+        if gate:
+            return gate
+        chat_folders, folders_err = _get_rows("/api/chat/folders")
+        if folders_err:
+            return f"Error: {folders_err}"
+        fld_id, fld_err = _resolve_chat_folder_id(args["folder"], chat_folders)
+        if fld_err:
+            return f"Error: {fld_err}"
+        if not fld_id:
+            return "Error: 'root' is not a folder — name the folder to change."
+        # One PATCH to the route the sidebar's Folder settings use, carrying the
+        # ONE field this tool changes. The endpoint owns the whole rule: path
+        # validation (same validator and, on macOS, overlap guard as create), and
+        # the principal fence -- a crew member may not change an EXISTING
+        # folder's binding at all, because the sessions a binding reaches (every
+        # one filed in the subtree, live or archived) live in stores the folder
+        # store shares no lock with, so their ownership cannot be established
+        # atomically with the write; an app may not give a folder a binding on
+        # any path; a person keeps full authority. Its refusal is surfaced
+        # rather than pre-judged here, so one rule lives in one place; that
+        # one-code refusal gets a static hint naming the path that IS open to a
+        # crew member, and none for an app. An empty string is
+        # the endpoint's own "clear" spelling, and a JSON ``null`` is the SAME
+        # clear: the schema hands it through as ``None`` (a non-required field's
+        # default -- the custom validator only tests key presence), and
+        # ``str(None)`` would be the literal ``"None"``, which the PATCH would
+        # carry as a directory name.
+        body = {"project_dir": str(args.get("project_dir") or "").strip()}
+        # The one pre-check, lexical and the endpoint's own helper: a UNC-shaped
+        # value names a host the gateway's ``realpath`` would contact over SMB,
+        # so the endpoint refuses the shape before any filesystem call and this
+        # tool refuses it before the PATCH -- no round trip, and the text never
+        # travels. The ``""`` clear is not UNC-shaped and passes untouched.
+        unc_err = project_dir_unc_refusal(body["project_dir"])
+        if unc_err:
+            return f"Error: {unc_err}"
+        d = _patch(f"/api/chat/folders/{fld_id}", body, session_key=caller_key)
+        if d.get("error"):
+            # The hint names the path that IS open to a crew member, and it keys
+            # on the endpoint's VERDICT -- the member arm's own "bind it when
+            # creating" -- not on a re-derivation of who is calling. This layer
+            # cannot derive that: an app's refusal and a channel caller's carry
+            # the same code, and a channel caller may be a dashboard-born slot
+            # linked to a Slack thread, whose ``dashboard:<slot>`` key and
+            # missing app read exactly like a crew member's from here -- only
+            # the endpoint, reading the gateway-owned link, can tell them
+            # apart. Both are refused a create-time binding as well, so a hint
+            # pointing them at chat_folder_create would send them to a second
+            # refusal; the member's text is the one that names the create path,
+            # so it is the one the hint elaborates.
+            hint = (
+                " (Bind a directory when you CREATE a folder -- chat_folder_create "
+                "with project_dir -- while nothing is filed in it yet; an existing "
+                "folder's binding is the person's to set or clear.)"
+                if d.get("code") == "folder_project_dir_forbidden"
+                and "bind it when creating" in str(d.get("error") or "")
+                else ""
+            )
+            return redact(f"Error: {d['error']}{hint}")
+        fld_path = _chat_folder_paths(chat_folders).get(fld_id, fld_id)
+        stored = str(d.get("project_dir") or "")
+        if stored:
+            return redact(
+                f"Set the project directory of `{fld_path}` (id={fld_id}) to {stored}. "
+                "A chat opened in this folder from now on inherits it; a session "
+                "already filed there picks it up on its next agent switch (set_project "
+                "re-scopes one immediately)."
+            )
+        return redact(
+            f"Cleared the project directory of `{fld_path}` (id={fld_id}). A chat "
+            "opened in this folder from now on inherits no folder binding and takes "
+            "the normal project fallback (a bound ancestor, else the dashboard or "
+            "workspace default); a session already filed there KEEPS the directory it "
+            "has: its next agent switch re-resolves the folder chain and applies a "
+            "bound ancestor if there is one, but with no binding left above it the "
+            "switch preserves the current directory unless the new agent names a "
+            "workspace of its own -- so to move an existing session off the cleared "
+            "directory, call set_project in that session."
+        )
 
     if name == "chat_folder_move":
         args = validate_tool_args(args, CHAT_FOLDER_MOVE_SCHEMA)

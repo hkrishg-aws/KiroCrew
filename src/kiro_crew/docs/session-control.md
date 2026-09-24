@@ -4,7 +4,7 @@ One chat session can open, fork, seed, watch, stop and close another one, and ta
 another one under itself in the sidebar. The tools come from the
 `kirocrew-dashboard` MCP server, so an agent that does not mount that server
 never has them — exactly like any other MCP server. This page is the reference
-for all 17 of its tools, written for the agent that is about to use them.
+for all 18 of its tools, written for the agent that is about to use them.
 
 The server is defined in `src/kiro_crew/mcp_dashboard.py`. Two halves:
 
@@ -12,8 +12,9 @@ The server is defined in `src/kiro_crew/mcp_dashboard.py`. Two halves:
   `session_read_message`, `session_stop`, `session_close`, `session_adopt`,
   `session_release`. These reach another session.
 - **Sidebar shape** — `chat_folder_tree`, `chat_folder_create`,
-  `chat_folder_move`, `chat_folder_move_session`, `chat_folder_file_self`,
-  `chat_tag_list`, `chat_tag_create`, `chat_tag_update`, `chat_tag_assign`.
+  `chat_folder_update`, `chat_folder_move`, `chat_folder_move_session`,
+  `chat_folder_file_self`, `chat_tag_list`, `chat_tag_create`,
+  `chat_tag_update`, `chat_tag_assign`.
   These organize what the person sees in the sidebar.
 
 Everything a created session does is visible: it appears in the user's sidebar
@@ -235,10 +236,75 @@ The sidebar tree the person organizes their sessions in.
 | Tool | Arguments | What it does |
 |---|---|---|
 | `chat_folder_tree` | none | Every folder (id, human path, project dir, default agent) with the live sessions nested under it, plus an `(unfiled)` group. Listed in **sidebar order**, not alphabetically |
-| `chat_folder_create` | `name` (required), `parent` | Create a folder. `parent` is an id or a `/`-separated path; missing segments are created (`mkdir -p`). Omit or pass `root` for top level. Creating never moves anything |
+| `chat_folder_create` | `name` (required), `parent`, `project_dir` | Create a folder. `parent` is an id or a `/`-separated path; missing segments are created (`mkdir -p`). Omit or pass `root` for top level. `project_dir` (absolute path of an existing directory) binds the new folder to a project. Creating never moves anything |
+| `chat_folder_update` | `folder` (required), `project_dir` (required) | Set an existing folder's project directory, or pass `""` (or `null`) to clear it. `folder` is an id or path. Changes nothing else |
 | `chat_folder_move` | `folder` (required), `new_parent`, `before`, `after` | Reparent a folder and/or set its position among siblings. Moves everything inside it; cycle-guarded |
 | `chat_folder_move_session` | `session` (required), `folder` | File another live session into a folder, or omit `folder` to unfile it to the top level |
 | `chat_folder_file_self` | `folder` | File **this** session — the caller — into a folder. Writes only its own placement |
+
+A folder's **project directory** is what a chat the person opens inside it
+inherits at creation (the sidebar's new-chat path, `POST /api/chat/slots`), and
+that inheritance is the only zero-cost way to a project-scoped session: context
+(the project's `.kiro/steering`, repo-scoped lessons) is injected once at
+session start, and `set_project` later tears the session down to re-scope it.
+`session_create` files its child into a folder but resolves the child's project
+from the caller's workspace, not from the folder — that inheritance is a
+separate change (#11680). So bind the folder before chats are opened in it:
+`chat_folder_create` with `project_dir`, or `chat_folder_update` on a folder
+that already exists.
+Both go through the same validation the sidebar's Folder settings apply — an
+absolute path to an existing directory, never a sensitive location such as
+`~/.aws` or `~/.ssh` — and a refused
+path changes nothing: `chat_folder_update` leaves the folder as it was, and
+`chat_folder_create` does not create the folder (parent segments a `mkdir -p`
+`parent` asked for are created first and named in the result). To clear a
+binding, pass `project_dir: ""` to `chat_folder_update` (a JSON `null` is read
+as the same clear). The stored path
+is re-checked every time a chat is opened in the folder, so bind a directory
+that outlives the folder rather than a scratch or worktree path: while a bound
+directory is missing, every new chat in that folder is refused until
+`chat_folder_update` fixes or clears the binding. Changing a folder's directory
+does not re-scope sessions already filed there on the spot: a filed session
+picks up the folder's current binding on its next agent switch (the switch
+re-resolves the folder's directory, a bound ancestor included), and `set_project`
+is the immediate path — it tears the session down to re-scope it. Because a
+binding reaches every session filed in the folder's subtree that way, changing
+an EXISTING folder's binding is the person's alone: an app or crew member cannot
+set or clear it (not even on a folder it created that holds only its own
+folders — the person may have filed one of their own chats there, and the folder
+store cannot see sessions atomically). A crew member binds a folder when it
+creates it, with `chat_folder_create`'s `project_dir`, while nothing is filed in
+it yet — and that binding reaches only chats running AS the member (its own
+workers), never the person's chat filed in the member's folder, which inherits
+the nearest binding of the person's own above it or the workspace default: the
+same owner-scoped delivery a folder's `steering_dirs` already follow, so a
+member's create cannot choose the directory the person's session is launched
+in. An app agent cannot bind a folder at all — not at create either — and a
+chat filed in a folder an app owns inherits no project directory, whatever the
+folder stores; nor does a folder nested beneath an app's inherit anything the
+app's folder stores (the walk skips it and goes on to the next ancestor): an
+app-chosen directory must never become the project a session is launched in.
+For the same reason a crew member cannot move a folder to where the sessions
+filed in it would inherit a different directory (an unbound folder takes its
+nearest bound ancestor's, so moving it under a folder bound at create, or out
+from under a binding, would rebind the chats inside it): an unbound
+folder moves only between places that confer the same bindings, a folder the
+member bound at create moves only where the person's chats filed in it keep
+resolving the same ancestor binding (the member's own binding stops only the
+member's chats), and a folder the person bound moves freely. An app's move is
+not held to that rule
+— a chat filed in an app's folder resolves no binding wherever the folder sits,
+so no move of the app's own folders changes what any chat resolves. Neither an
+app nor a crew member may move a folder to where its sessions would inherit
+different steering directories (a folder's `steering_dirs` are read into every
+chat filed beneath it). A channel agent (a Channels session, a session driven
+from a messaging channel such as Slack or Discord, or a dashboard session linked
+to a Slack thread — its turns are driven from that thread, whichever side typed
+them, and a turn the thread produced stays a channel caller for as long as it
+runs, even after the session is unlinked) cannot bind a folder at all — neither at create nor with
+`chat_folder_update` — and, though it may move the person's folders, is held to
+the same rules on a move: not across a binding, not across declared steering.
+`chat_folder_tree` shows each folder's current binding as `project=…`.
 
 Read `chat_folder_tree` before you move anything: it renders folders in the order
 the person actually sees, which is what makes a `before` / `after` anchor safe to

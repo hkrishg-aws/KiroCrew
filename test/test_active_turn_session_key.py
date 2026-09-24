@@ -200,6 +200,86 @@ class TestTheKeyDoesNotOutliveItsTurn:
         assert slot._active_turn_session_key == ""
 
 
+class TestTheTurnsChannelOriginRidesTheSameLifecycle:
+    """``_active_turn_channel_origin``: WHO produced the running turn, published
+    beside the key and retired with it. The folder fences
+    (``chat_folders._linked_thread_principal``) read it before the slot's Slack
+    link, because the link is mutable underneath a turn -- the unlink route and
+    a thread handoff clear it while the thread's turn keeps running -- and a
+    principal read off the live link alone relabelled that turn as the person's
+    mid-flight."""
+
+    THREAD = "1785370133.085469"
+
+    @staticmethod
+    def _observing(client: MagicMock, slot, sink: list) -> None:
+        async def _observe(msg):
+            sink.append(slot._active_turn_channel_origin)
+            return
+            yield  # pragma: no cover - generator shape only
+
+        client.stream = _observe
+        client.stream_command = _observe
+
+    @pytest.mark.asyncio
+    async def test_a_thread_produced_turn_on_a_linked_slot_publishes_the_thread(
+        self, tmp_path
+    ) -> None:
+        state, slot, client = _state_and_slot(tmp_path)
+        slot._slack_linked = True
+        slot._slack_thread_ts = self.THREAD
+        slot._slack_channel = "C0000000001"
+        seen: list[str] = []
+        self._observing(client, slot, seen)
+
+        await _run_chat(state, slot, "test message", _directive_channel_origin=True)
+
+        assert seen == [f"slack:{self.THREAD}"]
+        assert slot._active_turn_channel_origin == "", "the snapshot outlived its turn"
+
+    @pytest.mark.asyncio
+    async def test_a_dashboard_produced_turn_publishes_nothing(self, tmp_path) -> None:
+        """Scope pin: the person's own turn on a linked slot leaves the snapshot
+        empty -- it names a channel's turn, never the person's."""
+        state, slot, client = _state_and_slot(tmp_path)
+        slot._slack_linked = True
+        slot._slack_thread_ts = self.THREAD
+        seen: list[str] = []
+        self._observing(client, slot, seen)
+
+        await _run_chat(state, slot, "test message")
+
+        assert seen == [""]
+
+    @pytest.mark.asyncio
+    async def test_a_channel_born_slot_publishes_its_own_key(self, tmp_path) -> None:
+        state, slot, client = _state_and_slot(tmp_path)
+        slot.linked_session_key = LINKED_KEY
+        seen: list[str] = []
+        self._observing(client, slot, seen)
+
+        await _run_chat(state, slot, "test message", _directive_channel_origin=True)
+
+        assert seen == [LINKED_KEY]
+
+    @pytest.mark.asyncio
+    async def test_retired_after_a_provider_error(self, tmp_path) -> None:
+        state, slot, client = _state_and_slot(tmp_path)
+        slot._slack_linked = True
+        slot._slack_thread_ts = self.THREAD
+
+        async def _raise(msg):
+            raise RuntimeError("provider down")
+            yield  # pragma: no cover - generator shape only
+
+        client.stream = _raise
+        client.stream_command = _raise
+
+        await _run_chat(state, slot, "test message", _directive_channel_origin=True)
+
+        assert slot._active_turn_channel_origin == ""
+
+
 class TestOneTurnCannotRetireAnother:
     @pytest.mark.asyncio
     async def test_the_clear_lands_before_a_successor_can_start(

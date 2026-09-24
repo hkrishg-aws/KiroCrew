@@ -186,7 +186,144 @@ NOT seed a first message: that would be delivery.
 `session_create` also takes an optional `folder` — a folder id or `/`-separated
 human path, resolved with `chat_folder_create`'s `parent` semantics (missing
 segments created, behind the same tree-shaping gate) — and files the slot as
-part of creation (#6118). The caller's OWN slot is filed the same way with
+part of creation (#6118). A folder's project binding is agent-settable too —
+`chat_folder_create`'s `project_dir`, or `chat_folder_update` on an existing
+folder (#10432), both running the folder endpoint's own validator, never a copy —
+and a chat the person opens in a bound folder (`POST /api/chat/slots`) inherits
+the nearest ancestor's `project_dir` at creation, before its context is built.
+That endpoint refuses a UNC-shaped `project_dir` (`\\host\share`, `//host/share`,
+`\\?\UNC\host\share`) lexically, before its first filesystem call, through the
+repo's one UNC gate (`is_unc_shape` with the `unc_probe_allowed` allowance) —
+on a Windows gateway `realpath` on such text opens an SMB connection to the
+named host, an outbound credential probe — and refuses the shape on every host,
+since path text is untrusted everywhere; the two folder tools run the same
+helper (`project_dir_unc_refusal`) before posting, so the text never travels
+and the agent reads the endpoint's own refusal without a round trip. The rule is
+ADMISSION-only: it runs where a request names a directory — the folder create
+and update routes and the scaffold's scan root (`_admit_project_dir`), the
+`set_project` directive and `POST /api/chat/slots/{slot}/project` (the same
+helper, before their own `realpath`), and the tools' pre-check — and never on
+the read path. `_validate_project_dir` is also the stored-value reader
+(`_resolve_folder_project_dir`, on slot create and agent switch), and a folder
+bound to a share before the rule existed is a binding to honour, not a request
+to admit: refusing it there would fail every chat opened in that folder with a
+400 and drop the agent to the workspace default, a retroactive refusal with no
+migration; a stored value resolves exactly as it did.
+`chat_folder_update` clears a binding with `project_dir: ""`, and reads a JSON
+`null` as that same clear (never as the string `"None"`). A session already
+filed in the folder is not re-scoped by the change itself: it picks up the
+folder's current binding on its next agent switch — `api_chat_slot_agent`
+re-resolves the slot's folder chain through the create path's helper on every
+switch to a non-project-scope agent — and immediately through `set_project`.
+That reach is why the PATCH refuses an app's or member's `project_dir` change on
+an EXISTING folder outright (403 `folder_project_dir_forbidden`, before the
+path is validated), even on a folder it created that holds only its own folders:
+the sessions a binding reaches live in the slot table and the session archive,
+neither sharing a lock with the folder store, the archive's index carries no
+owner, and a session revives with its `folder_id` intact — so "every session
+under this folder is the caller's own" cannot be established atomically with
+the write (the same seam that refuses an app's folder delete). A crew member on
+a private store binds a folder at CREATE, when nothing is filed in it, and that
+binding reaches only chats running as the member (below); changing
+an existing binding is the person's. An APP is refused a non-empty `project_dir`
+at create as well (same 403, `_app_binding_refusal`, audited under
+`app_isolation`, before the path is looked at): the validator admits any
+existing, non-sensitive, non-overlapping directory, so it cannot tell a private
+host directory an app token names from a legitimate one, and the binding is what
+the gateway later hands a session as its project, cwd and steering root.
+`_is_app_principal` tells the two agent principals apart from the `owner_app`
+alphabet (an app's bare name against `member:<store>`). The read side closes
+every other route to the same reach, and delivery is OWNER-SCOPED
+(`_binding_reaches`, the steering gate's rule shared by both walks): the
+person's binding reaches every chat filed beneath it; a crew member's reaches
+only chats running AS that member — `_resolve_folder_project_dir` takes a
+`slot_app` spelled by `slot_steering_principal` over the SELECTION the reader
+commits (`chat_handlers._selection_principal`, built from the same bindings
+`_record_explicit_agent_selection` publishes, so the two spellings cannot
+drift): on slot create the caller's app claim, re-resolved as the member when an
+owner's create opens the chat AS one (`agent_kind: member`); on the agent switch
+the member being picked, never the record the slot carried until then (for the
+first pick of a member that record names nobody, and read off it the member's
+own binding was skipped and the workspace default committed as its first turn's
+directory, corrected only by a second same-name reset); a selection with no
+buildable execution resolves as the person, the least any chat is delivered
+— so the person's chat filed in a member's folder inherits nothing from it and
+resolves the nearest PERSON binding above it or `("", None)`; an app's binding
+reaches nobody. Two app rules stay stricter than the steering gate's: both
+readers resolve `("", None)` for a chat filed in
+a folder an app owns, whatever the folder or its ancestors store, and skip a
+binding stored on an app's folder when the walk passes through it from a folder
+beneath, so a binding that reaches an app's folder through the scaffold route
+(which writes an app-owned folder WITH its scanned root as the binding), the
+person's own Folder settings, or a row written before the rule is inert there
+— for a chat filed in the folder and for the person's folder nested beneath it
+alike; the walk goes on past any skipped binding to the nearest ancestor
+binding that reaches the chat. `_inherited_project_dir`, the move-time
+stored-string walk, answers per principal: a table `{owner_app: stored
+binding}` of the nearest binding per non-app owner up to the person's,
+canonical so equal tables mean every chat placed at the two places resolves
+the same binding whatever principal it runs as (as `_inherited_steering_dirs`
+carries each declarer's owner). The reparent path is bound by the same rule:
+an unbound folder's subtree inherits its nearest bound ancestor that reaches
+each chat, so an agent
+principal's `parent_id` change is refused (same 403, decided under the store
+lock) when the two places' tables differ for anyone the moved folder's own
+binding does not stop (`_move_changes_inherited_binding`) — moving under a
+folder that carries a
+binding, or out from under one, would rebind the chats filed
+inside it; a folder the PERSON bound moves freely (its binding reaches every
+chat, so its subtree resolves it wherever it sits), a folder a crew member bound
+at create does not (its binding stops only the member's own chats, so the
+person's chat filed in it resolves the ancestors and the move is compared for
+everyone else), and a move
+between places that confer the same bindings lands. An app's move is exempt from
+this branch: `foreign_descendant` has already proved its subtree holds only its
+own folders, and a chat filed in an app's folder resolves no binding wherever
+the folder sits, so no move of the app's can change what any chat resolves. A
+channel caller — a Channels
+agent (`channel:<channel_id>:<agent_id>`), a session driven from a messaging
+transport (`slack:`, `discord:`, every namespace in `CHANNEL_SESSION_NAMESPACES`,
+recognised through `messaging.link.is_channel_session_key`, never re-listed), or
+a dashboard-born slot linked to a Slack thread (gateway-owned link state,
+`_slack_linked` / `_slack_thread_ts`, written only by `state.link_slack`; its
+turns are driven from the thread while its key stays `dashboard:<slot>`, so
+`_linked_thread_principal` resolves it to the thread's own `slack:<ts>` key from
+slot state, reading the RUNNING turn's origin snapshot first —
+`_active_turn_channel_origin`, published by `_run_chat` at the start of a
+channel-produced turn and retired with it — and the link only after, because the
+link is mutable underneath a turn: the unlink route and a thread handoff clear it
+while the thread's turn keeps running, and a principal read off the live link
+alone relabelled that turn's later calls as the person's) —
+is refused a binding on all three paths with the same 403 — `project_dir` on the
+create, set-or-clear on the PATCH, and a reparent across a binding — because
+its key names no slot and no app, so `folder_principal` would otherwise read it
+as the person. The three binding fences key on ONE binding principal, derived
+once per request (`_binding_principal`: the folder principal when set, else the
+caller's own key when it is a channel caller's, else the linked thread's key
+when the caller's dashboard slot is linked to one, else the person), so they
+cannot
+disagree on who is confined; the ownership fences stay on the folder principal,
+which is why a channel caller may still reparent the person's folders between
+places with the same binding. The reparent branch compares what the moved
+subtree would inherit for STEERING as well (`_inherited_steering_dirs`: the
+stored declarations of every ancestor, root-first, with each declaring folder's
+owner — the data `_resolve_folder_steering_dirs` consumes, compared under the
+same lock and validation-free like the binding walk), and refuses an agent
+principal's move that changes it with the steering gate's 403
+(`steering_dirs_forbidden`): an agent principal may not declare steering, and a
+move under a folder that declares it, or out from under one, would hand those
+documents to — or take them from — every chat filed in the moved subtree at its
+next start, while the binding branch is silent whenever both places inherit the
+same binding. A move between places that inherit the same steering lands. The
+set-or-clear refusal comes before the path is looked at. The `steering_dirs`
+principal gate at both of its write sites (`_refuse_principal_steering_dirs`,
+spec'd in `config.md`) keys on the same binding principal: a steering
+declaration is a gateway host-file read, the same gap class as a binding, so a
+channel caller is refused it the way an app or crew member is, with that gate's
+own 403 (`steering_dirs_forbidden`).
+`session_create` itself still resolves the child's project from the caller's
+workspace (`default_project_dir`), not from the folder it files into; #11680
+adds that inheritance. The caller's OWN slot is filed the same way with
 `chat_folder_file_self` (folder tools, same server): it takes no `session`
 argument, resolves the target from the verified caller key, and so can be
 granted where `chat_folder_move_session` is withheld — a conductor files itself

@@ -8119,7 +8119,20 @@ handle immediately.
 #: * ``chat_folder_create`` — creates a NEW folder, and
 #:   ``_refuse_tree_shaping_if_unverifiable`` refuses an unverifiable caller and
 #:   keeps an app agent out of the person's own folders. Touches nothing that
-#:   already existed, and bounded by ``MAX_CHAT_FOLDERS``. GRANTED.
+#:   already existed, and bounded by ``MAX_CHAT_FOLDERS``. GRANTED. Its optional
+#:   ``project_dir`` binds only the folder being born, through the endpoint's own
+#:   validator (the rule the sidebar's Folder settings and ``set_project`` share:
+#:   existing directory, never a sensitive path), and the binding it stores is
+#:   delivered only to chats running AS the conductor -- its own workers -- never
+#:   to the person's chat filed in that folder (``chat_folders._binding_reaches``,
+#:   the steering gate's own rule); so it names nothing the agent could not
+#:   already name, mutates nothing the person arranged, and cannot choose where
+#:   the person's session is launched.
+#: * ``chat_folder_update`` — WITHHELD. Sets or clears the project directory of
+#:   an EXISTING folder, which is state the person arranged (a folder's binding
+#:   decides what a chat opened in it inherits), and no conductor step needs it:
+#:   a conductor that wants a bound folder binds it at creation with
+#:   ``chat_folder_create``'s ``project_dir``.
 #: * ``chat_folder_file_self`` — writes the CALLER'S OWN ``folder_id``, and only
 #:   that: the target slot is the ``dashboard:<slot>`` the verified caller key
 #:   names (``mcp_dashboard._own_chat_slot``; a linked channel/cron slot is

@@ -272,15 +272,27 @@ none" is the single on-disk representation and a PATCH with `[]` clears it.
   `400` with code `steering_dirs_invalid`.
 - **Principal gate** (`_refuse_principal_steering_dirs`) runs at both write
   sites BEFORE validation touches any path: only the person may declare a
-  non-empty list. A `POST`/`PATCH` carrying one from an app or crew-member
-  principal is refused `403` with code `steering_dirs_forbidden` and SEL-logged
-  as denied, because folder permission is not host-file permission -- the
-  gateway reads these files unsandboxed on the folder's behalf, and an app that
-  could point its own folder at an arbitrary readable Markdown tree would have
-  that read laundered into its own model session with no tool grant and no
-  signal. Clearing to `[]` stays allowed for every principal (it only removes
-  reads). The person may still declare steering on a folder an app or member
-  owns; delivery then routes it to that principal's chats as described below.
+  non-empty list. A `POST`/`PATCH` carrying one from an app, crew-member or
+  Channels-agent principal is refused `403` with code `steering_dirs_forbidden`
+  and SEL-logged as denied, because folder permission is not host-file
+  permission -- the gateway reads these files unsandboxed on the folder's
+  behalf, and an app that could point its own folder at an arbitrary readable
+  Markdown tree would have that read laundered into its own model session with
+  no tool grant and no signal. The gate keys on the BINDING principal
+  (`_binding_principal`, the value the `project_dir` fences key on), not the
+  folder principal: a channel caller's key — a Channels agent's
+  `channel:<channel_id>:<agent_id>`, or a messaging-transport session's
+  `slack:`/`discord:`/... key (`messaging.link.is_channel_session_key`) — names
+  no slot and no app, so the folder principal reads it as the person, and a
+  gate keyed on it would confine apps and members while the channel caller
+  declared what it liked -- the same gap class as the binding fences, closed by
+  the same derivation. The tree cannot route around the gate either: an agent
+  principal's reparent that would change the steering the moved subtree
+  inherits (`_inherited_steering_dirs`, spec'd in `session-control.md`) is
+  refused with this gate's 403. Clearing to `[]` stays allowed for every
+  principal (it only removes reads). The person may still declare steering on a
+  folder an app or member owns; delivery then routes it to that principal's
+  chats as described below.
 - **Resolution** (`_resolve_folder_steering_dirs`) is ACCUMULATIVE up the
   `parent_id` chain (root ancestor first, then descendants), unlike the
   nearest-wins `project_dir` resolver: an org-standards folder above a per-repo

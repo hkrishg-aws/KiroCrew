@@ -10169,6 +10169,26 @@ async def _run_chat(
         # the same finally, which compare-and-clears only an identity this
         # turn actually published, so a successor's key is never wiped.
         slot._active_turn_session_key = session_key
+        # WHO produced this turn, snapshotted for its duration. The folder
+        # fences decide a dashboard-born slot's principal from its Slack link
+        # (``chat_folders._linked_thread_principal``), and the link is mutable
+        # underneath a running turn: the unlink route and a thread handoff
+        # clear it while the thread's turn keeps running, and a principal read
+        # off the LIVE link then relabelled that turn's calls as the person's.
+        # A channel-produced turn on a dashboard-keyed slot publishes the
+        # thread's ``slack:<ts>`` (the only transport with a link map; an empty
+        # ts -- unlinked while the entry was queued -- still reads as a channel
+        # caller); a channel-born slot publishes its own key, which the fences
+        # already read as the channel. Retired in the same finally as the key.
+        slot._active_turn_channel_origin = (
+            ""
+            if not _directive_channel_origin
+            else (
+                session_key
+                if not session_key.startswith("dashboard:")
+                else f"slack:{str(getattr(slot, '_slack_thread_ts', '') or '').strip()}"
+            )
+        )
 
         # The gateway publishes this shared task before READY, then performs the
         # restore/open/rebuild work after READY. Wait at the one dashboard turn
@@ -18853,6 +18873,7 @@ async def _run_chat(
             # has something to retire.
             if slot._active_turn_session_key == session_key:
                 slot._active_turn_session_key = ""
+                slot._active_turn_channel_origin = ""
             # Spelling-independent backstop for a directive call whose tool
             # identity and result marker were both lost by the backend. The
             # validated payload reached the gateway, but no frame claimed it,

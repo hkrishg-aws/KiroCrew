@@ -35,6 +35,7 @@ from kiro_crew.folder_steering import crosses_memory_silo, memory_silo_fence
 from kiro_crew.hooks import is_unc_shape, unc_probe_allowed, validate_file_path
 from kiro_crew.llm_helpers import run_bg_oneliner
 from kiro_crew.loop_lock import LoopBoundLock
+from kiro_crew.messaging.link import is_channel_session_key
 from kiro_crew.sandbox import voice_runtime_workspace_conflict
 from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
@@ -475,8 +476,76 @@ async def api_chat_folders(request: web.Request) -> web.Response:
     return web.json_response(folders)
 
 
+#: The one refusal text for a UNC-shaped ``project_dir``; the tool pre-check and
+#: the validator return the same words so the agent reads one rule.
+PROJECT_DIR_UNC_REFUSAL = "Project directory must not be a network (UNC) path"
+
+
+def project_dir_unc_refusal(raw: str) -> str | None:
+    """The refusal for a UNC-shaped ``project_dir``, or ``None`` when the text is not one.
+
+    ``project_dir`` is agent-authored path text that reaches the gateway's
+    filesystem: ``realpath``/``isdir`` on ``\\\\host\\share``, ``//host/share``
+    or ``\\\\?\\UNC\\host\\share`` makes a Windows gateway open an SMB connection to
+    that host -- an outbound credential probe the text's author controls, with
+    no recovery once the handshake has left. So the shape is refused LEXICALLY,
+    before the first filesystem call, through the repo's one UNC gate
+    (:func:`~kiro_crew.hooks.is_unc_shape` with the
+    :func:`~kiro_crew.hooks.unc_probe_allowed` allowance for shares this
+    gateway itself writes to -- the same pair the steering validator below and
+    the attachment readers apply). Refused on EVERY host, not only Windows: the
+    text is untrusted everywhere and this never reads the platform. Pure string
+    work, so the MCP tool runs it too, before posting, and an agent gets the
+    endpoint's own words without a round trip; the endpoint stays the authority
+    and audits its refusal.
+
+    An ADMISSION rule: every site where a request NAMES a directory runs it --
+    :func:`_admit_project_dir` for the folder routes and the scaffold's scan
+    root, the ``set_project`` directive and the slot project endpoint for a
+    session's own project, the MCP pre-check -- and none of the READ paths do.
+    :func:`_validate_project_dir` is also the stored-value reader
+    (:func:`_resolve_folder_project_dir`, on slot create and agent switch), and
+    a folder the person bound to a share before this rule existed is a binding
+    to honour, not a request to admit: refusing it there would fail every chat
+    opened in that folder and drop the agent to the workspace default, a
+    retroactive refusal with no migration.
+    """
+    if is_unc_shape(raw) and not unc_probe_allowed(raw):
+        return PROJECT_DIR_UNC_REFUSAL
+    return None
+
+
+def _admit_project_dir(raw: str) -> tuple[str, str | None]:
+    """Validate a ``project_dir`` a REQUEST names. Returns (resolved_path, error_msg).
+
+    :func:`project_dir_unc_refusal` first -- before the absolute-path check on
+    purpose, since ``\\\\host\\share`` is not "absolute" on POSIX and this is the
+    refusal that must win everywhere -- audited like the sensitive-path
+    refusal, then :func:`_validate_project_dir`. The create and update routes,
+    the scaffold's scan root and the MCP tool's pre-check are its callers; the
+    read paths call the validator directly (see the helper's docstring).
+    """
+    if raw:
+        unc_err = project_dir_unc_refusal(raw)
+        if unc_err:
+            sel().log_api_access(
+                caller="dashboard",
+                operation="chat.folder_project_dir",
+                outcome="denied",
+                resources=raw,
+                error="UNC path",
+            )
+            return "", unc_err
+    return _validate_project_dir(raw)
+
+
 def _validate_project_dir(raw: str) -> tuple[str, str | None]:
-    """Validate and normalize project_dir. Returns (resolved_path, error_msg)."""
+    """Validate and normalize project_dir. Returns (resolved_path, error_msg).
+
+    Shared by the admission sites (through :func:`_admit_project_dir`) and the
+    read path (:func:`_resolve_folder_project_dir`), so it carries no
+    admission-only rule: a stored value is re-checked exactly as it always was.
+    """
     if not raw:
         return "", None
     if not os.path.isabs(raw) and not raw.startswith("~"):
@@ -524,11 +593,69 @@ def _folder_project_overlap_denied(resolved: str) -> str | None:
     return conflict
 
 
+def _binding_reaches(owner: str, slot_app: str) -> bool:
+    """Whether a binding stored on a folder *owner* owns is delivered to a chat
+    running as *slot_app* -- the owner-scoped delivery rule, in one place.
+
+    The same rule :func:`_resolve_folder_steering_dirs` applies to steering,
+    spelled from the same alphabet (``owner_app`` on the folder,
+    :func:`slot_steering_principal` on the slot): the PERSON's binding (an
+    unowned folder, ``""``) reaches every chat filed beneath it; a crew
+    MEMBER's (``member:<store>``) reaches only chats running AS that member,
+    never the person's chat filed in the member's folder nor another
+    principal's; an APP's reaches nobody, the app's own chats included. The
+    member rule exists for the reason the steering fence names an admitted
+    member as confined: a member cannot touch a slot's project directly
+    (``POST /api/chat/slots/{slot}/project`` is not admitted to it), so its
+    create-time binding must not become the way the gateway launches the
+    PERSON's chat -- filed in the member's folder from the sidebar -- in a
+    directory the member chose, with that directory's ``.kiro/steering`` read
+    into the person's session. The member's own workers are its own to place.
+    """
+    if _is_app_principal(owner):
+        return False
+    return not owner or owner == slot_app
+
+
 def _resolve_folder_project_dir(
-    folders: list[dict[str, Any]], folder_id: str
+    folders: list[dict[str, Any]], folder_id: str, *, slot_app: str = ""
 ) -> tuple[str, str | None]:
-    """Return the nearest validated project directory inherited by a folder."""
+    """Return the nearest validated project directory a folder confers on a chat.
+
+    Delivery is OWNER-SCOPED (:func:`_binding_reaches`): a stored binding is
+    taken only when it reaches a chat running as *slot_app* -- the principal
+    spelled by :func:`slot_steering_principal`, ``""`` for the person's chat,
+    ``member:<store>`` for a crew member's, an app's name for an app's -- and
+    is otherwise skipped, the walk going on to the nearest ancestor binding
+    that does reach. So the person's binding resolves for every chat beneath
+    it; a crew member's binding resolves for the member's own chats and for
+    nobody else's, a person's chat filed in the member's folder resolving the
+    nearest PERSON binding above it or ``("", None)``; and a binding stored on
+    an app's folder resolves for no chat at all. Two app rules stay stricter
+    than the steering gate's, the read side of :func:`_app_binding_refusal`: a
+    folder an APP owns confers none -- a chat filed in it resolves
+    ``("", None)`` whatever the folder or its ancestors store -- and a binding
+    STORED on an app's folder is skipped when the walk passes through it from a
+    folder beneath. A binding is what the gateway hands a session as its
+    project, cwd and steering root, and an app must not be able to make it
+    launch a session in a directory the app chose. Keyed on the OWNER of the
+    folder holding the chat and of each folder the walk reads a binding from
+    (``owner_app``) rather than on who wrote the binding, because a stored row
+    does not say who did -- so a binding that reaches an app's folder by any
+    route (the scaffold route, which writes an app-owned folder WITH its
+    scanned root as the binding; the person's own Folder settings; a row
+    written before the rule) is inert there, for a chat filed in that folder
+    and for the person's folder nested beneath it alike. Inert, not a wall,
+    for an app's folder and a member's alike: the walk goes on past a skipped
+    binding to the nearest ancestor binding that reaches. Both readers (slot
+    create and agent switch) go through here, so the two agree; the move
+    rule's stored-string walk (:func:`_inherited_project_dir`) answers per
+    principal from the same rule.
+    """
     by_id = {str(folder.get("id") or ""): folder for folder in folders if isinstance(folder, dict)}
+    start = by_id.get(folder_id)
+    if start is not None and _is_app_principal(_folder_owner_app(start)):
+        return "", None
     seen: set[str] = set()
     current_id = folder_id
     while current_id and current_id not in seen:
@@ -537,7 +664,7 @@ def _resolve_folder_project_dir(
         if folder is None:
             break
         raw_project = folder.get("project_dir")
-        if raw_project:
+        if raw_project and _binding_reaches(_folder_owner_app(folder), slot_app):
             if not isinstance(raw_project, str):
                 return "", "project_dir must be a string"
             return _validate_project_dir(raw_project.strip())
@@ -561,7 +688,7 @@ MAX_FOLDER_STEERING_DIR_LEN = 4096
 
 
 def _refuse_principal_steering_dirs(
-    request_app: str, steering_dirs: list, *, operation: str, folder_id: str
+    principal: str, steering_dirs: list, *, operation: str, folder_id: str
 ) -> web.Response | None:
     """Only the PERSON may declare steering directories; refuse everyone else.
 
@@ -578,14 +705,28 @@ def _refuse_principal_steering_dirs(
     calls carry the empty principal and are unaffected; a person can still
     declare steering on a folder an app or member owns, and the delivery gate
     then routes it to that principal's chats as before.
+
+    *principal* is the BINDING principal (:func:`_binding_principal`), not the
+    folder principal: a channel caller's key -- a Channels agent's, or a
+    session's driven from a messaging transport such as Slack -- names no slot
+    and no app, so the folder principal reads it as the person, and a fence
+    keyed on it would confine apps and members while the channel caller -- with
+    the person's full authority over the person's folders -- declared what it
+    liked. A steering declaration is a host-file read the gateway performs, at
+    least as sensitive as the project binding that fence exists for, so it is
+    the same gap class and keys on the same value: one derivation, the two
+    steering write sites beside the three binding paths. Same refusal for
+    every non-person principal; the audit names the channel key as the caller,
+    like the binding fence, and its source as the channel rather than app
+    isolation.
     """
-    if not request_app or not steering_dirs:
+    if not principal or not steering_dirs:
         return None
     sel().log_api_access(
-        caller=request_app,
+        caller=principal,
         operation=operation,
         outcome="denied",
-        source="app_isolation",
+        source="channel" if _is_channel_caller_key(principal) else "app_isolation",
         resources=f"folder={folder_id or '-'} steering_dirs={len(steering_dirs)}",
         error="steering_dirs may be declared only by the person",
     )
@@ -946,7 +1087,11 @@ def _subtree_holds_foreign_folder(
     would otherwise relocate a folder the person nested inside it, which is the
     same violation as editing that folder directly, reached one level down.
 
-    Used by the reparent path only. Delete asks a stricter question instead --
+    Used by the reparent path. A ``project_dir`` change is not gated by this
+    test: an agent principal may not change an existing folder's binding at
+    all (see ``api_chat_folder_update``), because the sessions that binding
+    reaches live outside the folder store.
+    Delete asks a stricter question instead --
     whether the folder is EMPTY -- because a delete has more kinds of content to
     account for (sessions, and archived sessions a live scan cannot see), and
     emptiness answers all of them without an ownership test per content type.
@@ -966,6 +1111,353 @@ def _subtree_holds_foreign_folder(
         if _is_descendant(folders, ancestor_id=root_id, folder_id=fid):
             return True
     return False
+
+
+def _inherited_project_dir(folders: list[dict[str, Any]], folder_id: str) -> dict[str, str]:
+    """The STORED bindings a folder placed under *folder_id* would inherit, by
+    principal: ``{owner_app: stored project_dir}``.
+
+    The same nearest-ancestor walk as :func:`_resolve_folder_project_dir`,
+    minus the path validation: this is called inside the folder store's mutate
+    callback, on the event loop and under the store lock, where the validator's
+    realpath/isdir would block every other request. Stored values are compared
+    verbatim -- both sides of the comparison were written by the same validator,
+    so equal strings are the same binding and different strings are not.
+
+    Delivery is owner-scoped (:func:`_binding_reaches`), so ONE string cannot
+    say what a place confers: a chat running as crew member M resolves the
+    nearest binding M's folders or the person's store, every other chat only
+    the person's. The answer is therefore a table, one entry per owner whose
+    binding some chat placed here would resolve -- the same reading
+    :func:`_inherited_steering_dirs` gives by carrying each declarer's owner.
+    The walk records the nearest binding per non-app owner and stops at the
+    person's (``""``), which reaches every chat so nothing above it can be
+    resolved by anyone; a binding stored on an APP's folder is skipped as the
+    resolver skips it. Canonical: a member entry equal to the person's is
+    dropped, since that member's chats resolve the same directory either way.
+    So two equal tables mean every chat placed at the two places resolves
+    exactly the same binding, whatever principal it runs as, and two unequal
+    tables mean some chat would not. ``{}`` for the top level (an empty
+    *folder_id*) and for a chain storing nothing a chat could resolve.
+    Cycle-guarded like every walk over ``parent_id``.
+    """
+    by_id = {str(f.get("id") or ""): f for f in folders}
+    table: dict[str, str] = {}
+    seen: set[str] = set()
+    current = folder_id
+    while current and current not in seen:
+        seen.add(current)
+        node = by_id.get(current)
+        if node is None:
+            break
+        bound = str(node.get("project_dir") or "").strip()
+        owner = _folder_owner_app(node)
+        if bound and not _is_app_principal(owner):
+            table.setdefault(owner, bound)
+            if not owner:
+                break
+        current = str(node.get("parent_id") or "")
+    persons = table.get("", "")
+    return {owner: bound for owner, bound in table.items() if not owner or bound != persons}
+
+
+def _move_changes_inherited_binding(
+    folders: list[dict[str, Any]], target: dict[str, Any], new_parent: str
+) -> bool:
+    """Whether reparenting *target* under *new_parent* changes the project
+    directory ANY chat in its subtree resolves.
+
+    Nearest wins, so a binding of *target*'s own is what its subtree resolves
+    first -- but owner-scoped delivery (:func:`_binding_reaches`) makes that
+    binding stop only the chats it reaches: the PERSON's own binding reaches
+    every chat, so a person-bound folder's subtree resolves it wherever the
+    folder sits and the move changes nothing; a crew MEMBER's binding stops
+    only that member's chats, and every other chat in the subtree walks past
+    it to the ancestors, so the two places are compared for everyone but that
+    member. An app's binding stops nobody (the resolver skips it), so an
+    app-bound folder compares like an unbound one -- an APP's own move is
+    exempt from the rule altogether, at the call site, because a chat filed in
+    an app's folder resolves no binding wherever the folder sits. Compared as
+    the two delivery tables :func:`_inherited_project_dir` builds under the
+    same lock.
+    """
+    own = str(target.get("project_dir") or "").strip()
+    owner = _folder_owner_app(target)
+    if own and not owner:
+        return False
+    before = _inherited_project_dir(folders, str(target.get("parent_id") or ""))
+    after = _inherited_project_dir(folders, new_parent)
+    if own and not _is_app_principal(owner):
+        before.pop(owner, None)
+        after.pop(owner, None)
+    return before != after
+
+
+def _inherited_steering_dirs(
+    folders: list[dict[str, Any]], folder_id: str
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """The STORED steering a folder placed under *folder_id* would inherit.
+
+    The steering analogue of :func:`_inherited_project_dir`, for the same
+    caller (the move rule inside the store's mutate callback, on the event loop
+    and under the store lock, where :func:`_resolve_folder_steering_dirs`'s
+    per-entry ``realpath``/``isdir`` would block every other request). Steering
+    ACCUMULATES up ``parent_id`` rather than nearest-wins, so the answer is the
+    chain, root-first: one ``(owner_app, declared entries)`` pair per ancestor
+    that declares any, stored strings verbatim, no validation and no dedup.
+    The owner rides along because the resolver delivers a folder's steering
+    only to chats running as that folder's principal -- so two chains that
+    declare the same directories under different owners steer different chats,
+    and must compare unequal. Equal tuples mean every chat in the moved subtree
+    would resolve exactly the steering it resolves today, whatever principal
+    it runs as. ``()`` for the top level and for a chain declaring nothing.
+    Cycle-guarded like every walk over ``parent_id``.
+    """
+    by_id = {str(f.get("id") or ""): f for f in folders}
+    chain: list[tuple[str, tuple[str, ...]]] = []
+    seen: set[str] = set()
+    current = folder_id
+    while current and current not in seen:
+        seen.add(current)
+        node = by_id.get(current)
+        if node is None:
+            break
+        raw = node.get("steering_dirs")
+        if isinstance(raw, list) and raw:
+            chain.append((_folder_owner_app(node), tuple(str(entry) for entry in raw)))
+        current = str(node.get("parent_id") or "")
+    return tuple(reversed(chain))
+
+
+def _is_channel_caller_key(session_key: str) -> bool:
+    """True for a caller whose words come from a channel other people are in.
+
+    Two key shapes, one caller for every fence in this module:
+
+    * a Channels agent (``channel.py``) -- ``channel:<channel_id>:<agent_id>``,
+      the namespace of the Channels feature, which is why
+      ``CHANNEL_AGENT_BLOCKED_TOOLS`` keeps it from the session-control verbs
+      and ``mcp_core``'s ``_deny_channel_agent_messaging`` refuses it;
+    * a session driven from a messaging transport -- ``slack:<ts>``,
+      ``discord:<id>``, every namespace in ``CHANNEL_SESSION_NAMESPACES``,
+      recognised through :func:`kiro_crew.messaging.link.is_channel_session_key`
+      (the roster is not re-listed here, so a transport added to it is fenced
+      without a change in this module).
+
+    Neither names a dashboard slot or an app, so
+    :func:`token_auth.folder_principal` reads both as the PERSON -- the one
+    identity the project-directory and steering fences do not confine. A fence
+    that recognised only the first shape let the second bind, rebind, reparent
+    across a binding and declare host-file reads with the person's authority;
+    so :func:`_binding_principal` makes EITHER key the principal those fences
+    key on. A third caller the KEY cannot show -- a dashboard-born slot whose
+    turns a linked Slack thread drives -- is read from gateway-owned slot state
+    instead (:func:`_linked_thread_principal`) and resolves to the second
+    shape, so this predicate stays a predicate on keys.
+    """
+    return session_key.startswith("channel:") or is_channel_session_key(session_key)
+
+
+def _binding_principal(request: web.Request, request_app: str) -> str:
+    """The principal the project-directory fence confines, or ``""`` for the person.
+
+    *request_app* -- the app's name or ``member:<store>`` that
+    :func:`token_auth.folder_principal` derived -- when it is set; else the
+    caller's own verified session key when it is a channel caller's
+    (:func:`_is_channel_caller_key`: a Channels agent's ``channel:`` key or a
+    messaging-transport session's ``slack:``/``discord:``/... key); else the
+    thread's ``slack:<ts>`` key when the caller's DASHBOARD slot is linked to a
+    Slack thread (:func:`_linked_thread_principal`, read from gateway-owned
+    slot state because that caller's key cannot show it); else ``""``.
+
+    Every fence on what a folder makes the gateway launch or READ keys on
+    THIS value, computed once per request: the bound create, the set-or-clear
+    PATCH, the cross-binding and cross-steering reparent decided inside the
+    store's mutate callback, and the ``steering_dirs`` declaration at both of
+    its write sites (:func:`_refuse_principal_steering_dirs`, the same gap
+    class -- a host-file read, not a binding, but confined for the same
+    reason). The ownership fences stay on the folder principal, which reads a
+    channel caller as the person (no slot, no app claim) -- so a fence on the
+    binding that reused it would confine apps and members and let the channel
+    caller through, as the reparent branch once did. One derivation, five
+    callers: the paths agree on WHO is confined by construction, and each path
+    keeps its own rule on what that principal may do (the app arm,
+    :func:`_app_binding_refusal`, is handed *request_app*, which IS this value
+    whenever it is set -- a channel key is never an app name). A channel caller's
+    principal is its key, not a sentinel, so the audit names the channel (and
+    the agent, for a Channels key), and so it collides with neither an app
+    name (a validated identifier, never a namespaced key) nor a member's
+    ``member:<store>``.
+    """
+    if request_app:
+        return request_app
+    caller_key = request.headers.get("X-Session-Key", "").strip()
+    if _is_channel_caller_key(caller_key):
+        return caller_key
+    return _linked_thread_principal(request.app["state"], caller_key)
+
+
+def _linked_thread_principal(state: Any, caller_key: str) -> str:
+    """``slack:<ts>`` when the DASHBOARD slot *caller_key* names is linked to a
+    Slack thread, else ``""``.
+
+    The third shape of the channel caller, and the one the key cannot show.
+    ``/kirocrew link-to-dashboard`` links a Slack thread to a dashboard-BORN
+    slot: the allowed users in that thread then drive its turns
+    (``slack.handler.maybe_route_linked_thread`` runs them with channel
+    provenance), but the slot's session key stays ``dashboard:<slot>`` -- it
+    is a channel-born slot, not a linked one, whose turns run on the channel's
+    own ``slack:<ts>`` key (``chat_utils.effective_session_key``). So a
+    principal derived from the key alone read a linked slot's turns as the
+    PERSON, and words from a thread other people are in bound folders, rebound
+    them across a move and declared host-file reads with the person's
+    authority -- the gap :func:`_is_channel_caller_key` closes for the two key
+    shapes, open again one slot away.
+
+    Decided from gateway-owned slot state, never from the request, and from
+    two fields in a fixed order. FIRST the running turn's own origin,
+    ``_active_turn_channel_origin`` -- published by ``chat_runner._run_chat``
+    at turn start for a channel-produced turn (``_directive_channel_origin``)
+    and retired with the turn -- because the link is mutable underneath a
+    turn: the unlink route and a thread handoff to another slot both clear it
+    while the thread's turn keeps running, and a principal read off the live
+    link alone relabelled that turn's later calls as the PERSON's, so a thread
+    that got its turn unlinked mid-flight bound folders with the person's
+    authority. The snapshot is the thread's ``slack:<ts>`` (or bare ``slack:``
+    for a turn whose link was already gone when it left the queue -- still a
+    channel caller). THEN the link itself, ``_slack_linked`` /
+    ``_slack_thread_ts``, written only by ``DashboardState.link_slack`` -- the
+    dashboard's own ``POST /api/chat/slots/{name}/slack-link``, a Slack thread
+    imported into a new slot, and a Slack-side session resume -- which persists
+    it through the session map so a restored slot keeps it, and cleared only by
+    its unlink. The slot is found by its effective session key, so the
+    dashboard slot the caller IS is the one read -- a channel-born slot never
+    reaches here (its key is already a channel key), and a caller whose slot
+    is gone resolves ``""`` and meets the tree-shaping gate's own refusal. The
+    principal is the thread's ``slack:<ts>`` key, the spelling a
+    transport-driven session carries, so the fences downstream need no third
+    arm and the audit names the thread as the caller with the channel as its
+    source. The read is conservative on purpose: it makes the PERSON's own
+    dashboard turns on a linked slot a channel caller for the binding and
+    steering fences too -- the link cannot say which side typed the turn --
+    and the refusals name the way out (ask the person: the person's unlinked
+    sessions are unconfined).
+    """
+    slots = getattr(state, "_slots", None)
+    if not caller_key or not isinstance(slots, dict):
+        return ""
+    for slot in list(slots.values()):
+        if effective_session_key(slot) != caller_key:
+            continue
+        turn_origin = str(getattr(slot, "_active_turn_channel_origin", "") or "").strip()
+        if turn_origin:
+            return turn_origin
+        if getattr(slot, "_slack_linked", False):
+            return f"slack:{str(getattr(slot, '_slack_thread_ts', '') or '').strip()}"
+        return ""
+    return ""
+
+
+def _channel_agent_binding_refusal(
+    binding_principal: str, *, operation: str, resources: str
+) -> web.Response | None:
+    """403 when a channel caller tries to set or clear a folder's binding, else None.
+
+    A folder's ``project_dir`` decides the project, cwd and steering of every
+    chat opened in it and of every filed session on its next agent switch. The
+    member fence on the set-or-clear path answers a channel caller's principal
+    too (:func:`_binding_principal`), but with a member's hint -- bind at
+    create -- that is a second refusal for a channel caller, which may not bind
+    at create either. So it is answered first, in its own words, ahead of the
+    app arm (:func:`_app_binding_refusal`) and the member arm, on the create
+    path (where a crew member IS allowed to bind) as on the PATCH.
+    Same status and code as those fences, so a client branches on one refusal;
+    the audit names the channel key, which is the principal. "Channel agent"
+    in the refusal covers both key shapes :func:`_is_channel_caller_key`
+    recognises: a Channels agent and a session driven from a messaging
+    transport are the same caller for this rule -- words from a thread other
+    people are in -- and the tool descriptions define the term that way.
+    """
+    if not _is_channel_caller_key(binding_principal):
+        return None
+    sel().log_api_access(
+        caller=binding_principal,
+        operation=operation,
+        outcome="denied",
+        source="channel",
+        resources=resources,
+        error="channel agent cannot set or clear a folder's project directory",
+    )
+    return web.json_response(
+        {
+            "error": (
+                "a channel agent cannot set or clear a folder's project directory - "
+                "ask the person"
+            ),
+            "code": "folder_project_dir_forbidden",
+        },
+        status=403,
+    )
+
+
+def _is_app_principal(principal: str) -> bool:
+    """True when *principal* names an APP -- not the person, not a crew member.
+
+    *principal* is spelled from the ``owner_app`` alphabet
+    (:func:`_folder_owner_app` / ``token_auth.folder_principal``): an app's
+    bare validated name, ``member:<store>`` for an admitted crew member, or
+    ``""`` for the person. The two agent principals are told apart here, once,
+    because the project-directory rule treats them differently: a crew member
+    on a private store binds the folder it creates (a conductor standing up a
+    project folder for its workers), a binding delivered to the member's own
+    chats alone (:func:`_binding_reaches`); an app never binds (see
+    :func:`_app_binding_refusal`) and its folders confer no binding
+    (:func:`_resolve_folder_project_dir`). A channel caller's key is never
+    passed here -- :func:`_channel_agent_binding_refusal` answers it first,
+    and the one place a channel key can appear (the binding principal) is
+    checked with :func:`_is_channel_caller_key` before this predicate runs.
+    """
+    return bool(principal) and not principal.startswith("member:")
+
+
+def _app_binding_refusal(
+    request_app: str, *, operation: str, resources: str
+) -> web.Response | None:
+    """403 when an APP tries to give a folder a project directory, else None.
+
+    The app arm of the binding fence, at create as on the PATCH. An app's
+    ``project_dir`` is agent-chosen host path text that the gateway later hands
+    a session as its project, cwd and steering root: with a create-time
+    binding an app token could post a private host directory, open a slot in
+    the folder and run there. Nothing in ``_admit_project_dir`` distinguishes
+    that directory from a legitimate one -- it admits any existing,
+    non-sensitive, non-overlapping path -- so the fence is on WHO binds, not
+    on the path, and it runs before the path is looked at. The person is
+    unconfined and a crew member keeps the create-time binding
+    (:func:`_is_app_principal`); the read side of the same rule
+    (:func:`_resolve_folder_project_dir`) makes a binding that reaches an
+    app's folder by any other route inert. Same status and code as the other
+    two arms (channel, and the PATCH's member arm), so a client branches on
+    one refusal; the audit names the app and the ``app_isolation`` source the
+    rest of this module's app fences use.
+    """
+    if not _is_app_principal(request_app):
+        return None
+    sel().log_api_access(
+        caller=request_app,
+        operation=operation,
+        outcome="denied",
+        source="app_isolation",
+        resources=resources,
+        error="app cannot set or clear a folder's project directory",
+    )
+    return web.json_response(
+        {
+            "error": "an app cannot set or clear a folder's project directory - ask the person",
+            "code": "folder_project_dir_forbidden",
+        },
+        status=403,
+    )
 
 
 def _is_descendant(folders: list[dict], *, ancestor_id: str, folder_id: str) -> bool:
@@ -1120,7 +1612,7 @@ async def create_folder_record(
     # Off-loop: realpath + isdir + the sensitive-path scan touch the filesystem,
     # and the scaffold calls this once per folder in a loop, so a slow or
     # network-mounted directory would otherwise stall every other request.
-    project_dir, err = await asyncio.to_thread(_validate_project_dir, requested_dir)
+    project_dir, err = await asyncio.to_thread(_admit_project_dir, requested_dir)
     if err:
         raise FolderCreateError(err)
     if require_resolved_project_dir and project_dir != requested_dir:
@@ -1317,12 +1809,41 @@ async def api_chat_folder_create(request: web.Request) -> web.Response:
     # the person's rows keep the shape they have on disk today and "absent means
     # the person" stays the one representation (see _folder_owner_app).
     request_app = folder_principal(state, request)
+    # One derivation for every fence on what a folder makes the gateway READ
+    # or launch: the steering fence right below and the three binding paths.
+    # The folder principal reads a channel agent as the person; this does not.
+    binding_principal = _binding_principal(request, request_app)
     refused = _refuse_principal_steering_dirs(
-        request_app, steering_dirs, operation="chat.folder_create", folder_id=""
+        binding_principal, steering_dirs, operation="chat.folder_create", folder_id=""
     )
     if refused is not None:
         return refused
     parent_id = str(body.get("parent_id") or "")
+    # A binding is the one field a channel agent and an APP may not write, at
+    # create as at update: the folder principal above reads a channel key as
+    # the person, so nothing downstream would refuse it, and an app's
+    # ``project_dir`` is an app-chosen host directory the gateway would hand a
+    # session as its project. The binding principal does not read a channel
+    # key as the person, and the app arm keys on the folder principal (an app's
+    # bare name; a member's ``member:<store>`` passes it). A crew member IS
+    # allowed to bind here (a new folder holds no sessions), and so is the
+    # person. An unbound create by any of these keys is not this fence's
+    # concern.
+    if str(body.get("project_dir") or "").strip():
+        if (
+            refusal := _channel_agent_binding_refusal(
+                binding_principal,
+                operation="chat.folder_create",
+                resources=f"parent={parent_id}",
+            )
+        ) is not None:
+            return refusal
+        if (
+            refusal := _app_binding_refusal(
+                request_app, operation="chat.folder_create", resources=f"parent={parent_id}"
+            )
+        ) is not None:
+            return refusal
     try:
         folder = await create_folder_record(
             state,
@@ -1382,6 +1903,10 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
     if not folder:
         return web.json_response({"error": "not found"}, status=404)
     request_app = folder_principal(state, request)
+    # Computed ONCE, above every fence and above ``_apply``: the set-or-clear
+    # fence below and the cross-binding reparent branch inside the mutate
+    # callback both key on it, so the two cannot disagree on who is confined.
+    binding_principal = _binding_principal(request, request_app)
     try:
         body = await request.json()
     except Exception:
@@ -1453,7 +1978,69 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
                 )
         changes["parent_id"] = new_parent
     if "project_dir" in body:
-        pd, err = _validate_project_dir(str(body["project_dir"] or "").strip())
+        # All three arms key on the binding principal. The channel agent is
+        # answered first, in its own words; then the app, whose refusal names
+        # no create-time path because it has none; the member arm below hints
+        # at binding at create, the one path that IS open to it. Same 403
+        # either way, refused before the path is looked at.
+        if (
+            refusal := _channel_agent_binding_refusal(
+                binding_principal, operation="chat.folder_update", resources=fid
+            )
+        ) is not None:
+            return refusal
+        if (
+            refusal := _app_binding_refusal(
+                request_app, operation="chat.folder_update", resources=fid
+            )
+        ) is not None:
+            return refusal
+        if binding_principal:
+            # A crew member may not set or clear the project directory of an
+            # EXISTING folder -- not even one it owns and, by the folder test,
+            # holds only its own folders. A folder's binding is what every
+            # session it reaches picks up on its next agent switch
+            # (``api_chat_slot_agent`` re-resolves the folder chain), and those
+            # sessions live in stores the folder store shares no lock with:
+            # the slot table and the session archive, whose index carries no
+            # owner and whose sessions revive with their ``folder_id`` intact.
+            # Delivery is owner-scoped (``_binding_reaches``), so the sessions
+            # a member's binding reaches are the member's own -- but a member
+            # is not admitted to re-scope a session it already runs any other
+            # way either (``POST /api/chat/slots/{slot}/project`` is not open
+            # to it), and which sessions sit under this folder cannot be
+            # established atomically with the write: "every session under
+            # this folder is the caller's own" leaks through the same seam
+            # that makes an agent principal's delete refused outright below
+            # (``api_chat_folder_delete``). Refused before the path is
+            # validated: no outcome of validating it could be used. A member
+            # chooses where NEW work starts -- a binding at CREATE, when the
+            # folder has no sessions yet -- and never re-scopes what is already
+            # filed; ``_apply`` below refuses the reparent that would reach the
+            # same sessions through inheritance (``binding_crossed``).
+            sel().log_api_access(
+                caller=binding_principal,
+                operation="chat.folder_update",
+                outcome="denied",
+                source="app_isolation",
+                resources=fid,
+                error="crew member cannot change an existing folder's project directory",
+            )
+            return web.json_response(
+                {
+                    "error": (
+                        "a crew member cannot change an existing folder's project "
+                        "directory - bind it when creating the folder, or ask the person"
+                    ),
+                    "code": "folder_project_dir_forbidden",
+                },
+                status=403,
+            )
+        # Off-loop, as create's call is: realpath/isdir on a stalled network
+        # path would otherwise hold every gateway task.
+        pd, err = await asyncio.to_thread(
+            _admit_project_dir, str(body["project_dir"] or "").strip()
+        )
         if err:
             return web.json_response({"error": err}, status=400)
         if pd:
@@ -1519,10 +2106,11 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
         # validated per entry (absolute/sensitive/isdir), capped at 16, and
         # deduped. Off the loop, like project_dir, since each entry stats disk.
         # Only the person may declare a non-empty list (see
-        # _refuse_principal_steering_dirs); the refusal precedes any path work.
+        # _refuse_principal_steering_dirs); the refusal precedes any path work
+        # and keys on the binding principal, so a channel agent is refused too.
         raw_steering = body["steering_dirs"]
         refused = _refuse_principal_steering_dirs(
-            request_app,
+            binding_principal,
             raw_steering if isinstance(raw_steering, list) else [raw_steering],
             operation="chat.folder_steering_dirs",
             folder_id=fid,
@@ -1584,6 +2172,76 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
             # renders exactly as a reparent does. Checked for a move to the top
             # level too -- "" is still a move.
             return False, "foreign_descendant"
+        if (
+            binding_principal
+            and reparenting
+            and not _is_app_principal(request_app)
+            and _move_changes_inherited_binding(folders, target, new_parent)
+        ):
+            # The binding axis of the same rule, keyed on the BINDING principal
+            # -- not on ``request_app`` like the three ownership branches above,
+            # which read a channel agent as the person and rightly let it
+            # reparent the person's folders. An agent principal may not change
+            # an EXISTING folder's ``project_dir`` (refused above the lock),
+            # because every session filed in its subtree -- live, or in the
+            # archive the folder store cannot see -- picks the binding up on
+            # its next agent switch. A reparent reaches the same sessions the
+            # same way: an UNBOUND folder's subtree resolves the nearest bound
+            # ANCESTOR that reaches each chat, so moving it under a bound
+            # folder (one of the person's, which a channel agent reaches) would
+            # rebind the person's chat filed inside it, and moving it out from
+            # under a binding would clear that chat's project. So a move may
+            # not change what ANY chat in the moved subtree resolves: compared
+            # per principal, as the delivery tables both places resolve to
+            # (``_inherited_project_dir``), under this lock. A folder bound by
+            # the PERSON is exempt -- nearest wins and the person's binding
+            # reaches every chat, so its subtree resolves it wherever it sits
+            # -- while a folder a crew member bound at create is not: its
+            # binding reaches only the member's own chats, and the person's
+            # chat filed in it resolves the ancestors, so the member may not
+            # move it across one. So is a move between two places that confer
+            # the same bindings to everyone. So is an APP's move altogether:
+            # ``foreign_descendant`` above has already proved its subtree holds
+            # only its own folders, and a chat filed in an app's folder
+            # resolves no binding wherever the folder sits
+            # (``_resolve_folder_project_dir``'s start-folder rule), so no move
+            # of the app's can change what any chat resolves -- the stored
+            # strings may differ while the resolved binding is ``""`` on both
+            # sides, and refusing on the strings would refuse a harmless
+            # reorganisation. ``request_app`` is the app's name whenever the
+            # principal is an app (a channel key is never an app name, so a
+            # channel agent moving an app's folder -- as the person -- stays
+            # under the rule: that subtree can hold the person's folders).
+            # Decided here,
+            # not above the lock, because a concurrent reparent or a person's
+            # PATCH can change what either place inherits between validation
+            # and the write. The person is not confined.
+            return False, "binding_crossed"
+        if (
+            binding_principal
+            and reparenting
+            and _inherited_steering_dirs(folders, str(target.get("parent_id") or ""))
+            != _inherited_steering_dirs(folders, new_parent)
+        ):
+            # The second thing ancestry decides for every chat filed beneath a
+            # folder: the steering directories it inherits, ACCUMULATIVELY, read
+            # into the chat's model context at session start. An agent principal
+            # may not DECLARE steering (``_refuse_principal_steering_dirs``); a
+            # reparent reaches the same chats through the tree -- moving the
+            # person's folder under one that declares steering hands those
+            # documents to every chat filed inside at its next start, and moving
+            # it out from under one takes them away -- and the binding branch
+            # above is silent whenever both places inherit the same binding. So
+            # a move may not change what the moved subtree inherits for steering
+            # either: compared as the stored chains both places accumulate,
+            # owner included (the resolver delivers a folder's steering only to
+            # its owner's chats), under this lock and validation-free like the
+            # binding walk. No exemption for a folder declaring its own steering:
+            # accumulation means it inherits its ancestors' regardless. A move
+            # between two places that inherit the same steering lands. Decided
+            # here, not above the lock, for the same concurrency reason. The
+            # person is not confined.
+            return False, "steering_crossed"
         target.update(changes)
         if not target.get("color"):
             target.pop("color", None)
@@ -1637,8 +2295,8 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
         # Deleted between the validation above and acquiring the store lock.
         return web.json_response({"error": "not found", "code": "folder_not_found"}, status=404)
     if err in ("not_owned", "forbidden_parent", "foreign_descendant"):
-        # Distinguished in the audit, not to the caller: one code for all three
-        # keeps the response from reporting which folder was foreign.
+        # Distinguished in the audit, not to the caller: one code for all of
+        # them keeps the response from reporting which folder was foreign.
         _reason = {
             "not_owned": "app cannot change a folder it does not own",
             "forbidden_parent": "app cannot move a folder into one it does not own",
@@ -1664,6 +2322,55 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "parent folder not found", "code": "folder_parent_not_found"},
             status=400,
+        )
+    if err == "binding_crossed":
+        # The folder IS the caller's (or, for a channel agent, the person's);
+        # what it may not do is move it across a binding boundary (``_apply``),
+        # so this is the binding fence's code, not the ownership one -- a client
+        # branches on the rule that refused it. Audited against the binding
+        # principal: an app's or member's name, or the channel key.
+        sel().log_api_access(
+            caller=binding_principal,
+            operation="chat.folder_update",
+            outcome="denied",
+            source="channel" if _is_channel_caller_key(binding_principal) else "app_isolation",
+            resources=fid,
+            error="agent cannot move a folder across what its subtree would inherit",
+        )
+        return web.json_response(
+            {
+                "error": (
+                    "a crew member or channel agent cannot move a folder where its "
+                    "sessions would inherit a different project directory - move it "
+                    "between places with the same binding, or ask the person"
+                ),
+                "code": "folder_project_dir_forbidden",
+            },
+            status=403,
+        )
+    if err == "steering_crossed":
+        # The steering axis of the same move rule (``_apply``): the steering
+        # fence's code, not the binding one, so a client branches on the rule
+        # that refused it. Audited against the binding principal, like its
+        # sibling above.
+        sel().log_api_access(
+            caller=binding_principal,
+            operation="chat.folder_update",
+            outcome="denied",
+            source="channel" if _is_channel_caller_key(binding_principal) else "app_isolation",
+            resources=fid,
+            error="agent cannot move a folder across what its subtree would inherit as steering",
+        )
+        return web.json_response(
+            {
+                "error": (
+                    "an app, crew member or channel agent cannot move a folder where its "
+                    "sessions would inherit different steering directories - move it "
+                    "between places with the same steering, or ask the person"
+                ),
+                "code": "steering_dirs_forbidden",
+            },
+            status=403,
         )
     if err == "cycle":
         # A concurrent reparent moved the target under this folder while this

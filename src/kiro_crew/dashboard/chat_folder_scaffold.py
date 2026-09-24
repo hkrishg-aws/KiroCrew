@@ -16,7 +16,7 @@ Three properties belong to this module rather than to the scanner:
 * **The scan root is validated by the folder API's own validator.** ``scan``
   refuses exactly what creating a folder by hand refuses — a relative path, a
   sensitive path, a path that is not a directory — because it calls the same
-  :func:`~kiro_crew.dashboard.chat_folders._validate_project_dir`. One function,
+  :func:`~kiro_crew.dashboard.chat_folders._admit_project_dir`. One function,
   and the message the user reads is the one they would have read anyway.
 * **Reconcile marking is an overlay, not a detection rule.** The scanner's
   output depends only on the filesystem and the passed configuration, which is
@@ -48,10 +48,10 @@ from kiro_crew.apps.manager import is_app_enabled
 from kiro_crew.dashboard.chat_folders import (
     FolderCreateError,
     FolderOwnershipError,
+    _admit_project_dir,
     _audit_origin,
     _effective_request_app,
     _refuse_unattributable_caller,
-    _validate_project_dir,
     create_folder_record,
 )
 from kiro_crew.dashboard.create_rate_limit import FOLDER_CREATE, allow_create
@@ -122,11 +122,11 @@ def _resolve_root(body: object) -> tuple[str, tuple[int, int]]:
         raise _BadRequest("request body must be a JSON object", "invalid_json")
     raw = _submitted_root(body)
     if not raw:
-        # ``_validate_project_dir`` accepts "" — a folder is allowed to have no
+        # ``_admit_project_dir`` accepts "" — a folder is allowed to have no
         # project directory at all — so the empty case has to be caught here or a
         # rootless scan would fall through to scanning nothing.
         raise _BadRequest("root required", "folder_scan_root_required")
-    resolved, err = _validate_project_dir(raw)
+    resolved, err = _admit_project_dir(raw)
     if err:
         raise _BadRequest(err, "folder_scan_root_invalid")
     # The folder validator answers "is this path itself protected?" — the scan
@@ -371,7 +371,7 @@ async def api_chat_folders_scan(request: web.Request) -> web.Response:
         # and one stalled network mount must not stall every chat behind it.
         root, identity = await asyncio.to_thread(_resolve_root, body)
     except _BadRequest as exc:
-        # ``_validate_project_dir`` already SEL-logs a sensitive-path refusal;
+        # ``_admit_project_dir`` already SEL-logs a sensitive-path refusal;
         # the other rejections are ordinary caller error.
         return _bad_request_response(exc)
 

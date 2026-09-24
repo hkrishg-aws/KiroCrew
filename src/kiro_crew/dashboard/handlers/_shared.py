@@ -1053,8 +1053,15 @@ async def private_chat_route_refusal(request: web.Request) -> web.Response | Non
 #: The admitted VERBS are exactly the ones a member may actually do -- a verb
 #: whose handler has no member fence is not admitted here, so the gate can never
 #: forward a request the fence would have to refuse (or, worse, one no fence
-#: covers). Concretely: a member creates folders and renames/reparents its OWN
-#: (POST + PATCH on the tree), but does NOT delete folders (delete is refused for
+#: covers). Concretely: a member creates folders (bound to a project directory
+#: at create, if at all -- and that binding reaches only chats running AS the
+#: member, never the person's chat filed in the member's folder, the rule
+#: ``chat_folders._binding_reaches`` shares with the steering gate) and
+#: renames/reparents its OWN (POST + PATCH on the
+#: tree) -- the PATCH handler refuses a member's or app's ``project_dir`` change
+#: on an existing folder, and a reparent that would change what the moved
+#: folder's sessions inherit (binding or steering) -- but does NOT delete
+#: folders (delete is refused for
 #: every agent principal); it READS the shared tag vocabulary (GET) but does NOT
 #: coin/rename/delete tags (``chat_tags.api_chat_tag_delete`` has no
 #: vocabulary fence at all, so admitting DELETE would let a member remove a
