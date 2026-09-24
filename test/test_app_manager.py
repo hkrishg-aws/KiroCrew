@@ -3536,3 +3536,47 @@ class TestRegisterExternalPreservesServerProvenance:
         assert meta.source == "C:/local/second"
         assert meta.sourceUrl == ""
         assert meta.origin == "external"
+
+
+class TestCarriedIntoAppDir:
+    """The copy's own rule, asked about a source-relative path: what an install
+    or update carries into the app directory verbatim."""
+
+    def test_ordinary_files_and_in_tree_dirs_are_carried(self):
+        from kiro_crew.apps.manager import carried_into_app_dir
+
+        assert carried_into_app_dir(Path("requirements.txt"))
+        assert carried_into_app_dir(Path("requirements/prod.txt"))
+        assert carried_into_app_dir(Path("backend/app.py"))
+        # `data` as a FILE name is carried; only the `data/` DIRECTORY is replaced.
+        assert carried_into_app_dir(Path("data"))
+
+    def test_the_preserved_data_directory_is_not(self):
+        from kiro_crew.apps.manager import carried_into_app_dir
+
+        # update_app puts the previous install's data/ back over the copied one.
+        assert not carried_into_app_dir(Path("data/requirements.txt"))
+        assert not carried_into_app_dir(Path("data/deep/requirements.txt"))
+
+    def test_the_copy_s_ignored_dirs_are_not_at_any_depth(self):
+        from kiro_crew.apps import manager as manager_mod
+        from kiro_crew.apps.manager import carried_into_app_dir
+
+        for ignored in manager_mod._COPY_IGNORE:
+            assert not carried_into_app_dir(Path(ignored) / "requirements.txt"), ignored
+            assert not carried_into_app_dir(Path("vendor") / ignored / "requirements.txt"), ignored
+            # The LEAF too: the copy's `ignore` callback drops by name whatever the
+            # entry's type, so a regular file with one of these names is dropped.
+            assert not carried_into_app_dir(Path(ignored)), ignored
+            assert not carried_into_app_dir(Path("vendor") / ignored), ignored
+        assert not carried_into_app_dir(
+            Path(".kirocrew-deps-staging-123-0123abcd") / "requirements.txt"
+        )
+        assert not carried_into_app_dir(Path(".kirocrew-deps-staging-123-0123abcd"))
+        # An app-owned name that merely shares the prefix is the app's data, and copied.
+        assert carried_into_app_dir(Path(".kirocrew-deps-staging-assets") / "requirements.txt")
+
+    def test_an_empty_path_is_not_a_file_the_copy_carries(self):
+        from kiro_crew.apps.manager import carried_into_app_dir
+
+        assert not carried_into_app_dir(Path())

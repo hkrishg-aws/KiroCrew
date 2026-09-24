@@ -461,6 +461,32 @@ def _is_generated_deps_artifact_name(n: str) -> bool:
     )
 
 
+def carried_into_app_dir(relative: Path) -> bool:
+    """True when a source-tree path (relative to the app root) reaches the app
+    directory verbatim through :func:`_copy_app_tree` and an update.
+
+    The two ways it does not: some component on its way -- the LEAF included,
+    because the copy's ``ignore`` callback drops by name whatever the entry's
+    type, so a regular file called ``node_modules`` is dropped like the
+    directory would be -- is one the copy drops at any depth
+    (:data:`_COPY_IGNORE`, the generated deps artifacts -- the callback's own
+    test), or its first component is ``data``, which :func:`update_app`
+    replaces wholesale with the PRESERVED previous data directory, so a file
+    the source ships there is exactly what an update does not carry. The
+    install-time desktop gate asks this about the target of a
+    ``requirements.txt`` link and about a declared entry point: a path that
+    resolves in the checkout but is not carried over is missing in the app
+    directory, where the provisioner reads and the spawn looks -- and both
+    refuse.
+    """
+    parts = relative.parts
+    if not parts:
+        return False
+    if parts[0] == "data" and len(parts) > 1:
+        return False
+    return not any(part in _COPY_IGNORE or _is_generated_deps_artifact_name(part) for part in parts)
+
+
 def _copy_app_tree(source: Path, dest: Path) -> None:
     """Copy an app source tree for install/update.
 

@@ -21,7 +21,9 @@ import { isNotFoundError } from '../api/apiError'
 import { PageHeader, Card, CardTitle, Badge, Btn } from '../components/ui'
 import SessionApprovalModes from '../components/appstore/SessionApprovalModes'
 import AppIcon from '../components/AppIcon'
-import TrustAppModal, { APP_EXECUTION_DENIED, isTrustDeniedError, useTrustGate } from '../components/appstore/TrustAppModal'
+import TrustAppModal, {
+  APP_EXECUTION_DENIED, DESKTOP_BUILD_STEP_UNSUPPORTED, isTrustDeniedError, useTrustGate,
+} from '../components/appstore/TrustAppModal'
 import { isRegistrySourced, sanitizeStargazersCount, type RegistryApp } from '../components/appstore/types'
 import AppSource from '../components/appstore/AppSource'
 import { recordEvent } from '../rum'
@@ -622,6 +624,18 @@ export default function AppDetailPage() {
   const [installDone, setInstallDone] = useState(false)
   const installLogRef = useRef<HTMLPreElement>(null)
   const installAbortRef = useRef<AbortController | null>(null)
+  /**
+   * The last install failure as reported: its message, for the trust retry to
+   * throw, and the machine `code` the stream's `done` payload carried beside it.
+   *
+   * A REF, not state: the retry closure reads it immediately after `runInstall()`
+   * returns, and a state update is not visible in that same tick. The message is
+   * the string `reportInstallFailure` journaled, so the consent modal's
+   * `ErrorNotice` recovers the endpoint and the install log tail from the same
+   * key it renders; the code rides on the thrown error so the modal can tell a
+   * permanent refusal from a failure worth retrying.
+   */
+  const installFailureRef = useRef<{ message: string; code: string }>({ message: '', code: '' })
   const [clientInstall, setClientInstall] = useState<{ shell?: string; postInstall?: string } | null>(null)
   const [copied, setCopied] = useState(false)
   const [serverHostname, setServerHostname] = useState('')
@@ -664,14 +678,18 @@ export default function AppDetailPage() {
    *  agent hand-off on the failure notice would carry only the one-line message.
    *  The log is read from the rendered <pre> (the accumulated state, not a stale
    *  closure); `recordError` redacts and caps it. The message string is the
-   *  journal key, so it must be exactly what `setError` shows. */
-  const reportInstallFailure = useCallback((message: string, source: 'api' | 'system') => {
+   *  journal key, so it must be exactly what `setError` shows. `code` is the
+   *  `done` payload's machine code, when it carried one, journaled so a client
+   *  can act on the failure instead of matching its prose. */
+  const reportInstallFailure = useCallback((message: string, source: 'api' | 'system', code = '') => {
     recordError({
       source,
       message,
+      code: code || undefined,
       endpoint: '/api/apps/registry/install-stream',
       detail: installLogRef.current?.textContent || undefined,
     })
+    installFailureRef.current = { message, code }
     setError(message)
   }, [])
 
@@ -955,6 +973,9 @@ export default function AppDetailPage() {
     setInstallDone(false)
     setShowInstallLog(true)
     clearError()
+    // Drop the previous attempt's reason: a retry that fails for a new cause (or
+    // is aborted, which has none) must never show the first attempt's.
+    installFailureRef.current = { message: '', code: '' }
     setClientInstall(null)
     installAbortRef.current?.abort()
     const controller = new AbortController()
@@ -1005,7 +1026,7 @@ export default function AppDetailPage() {
         await load()
         window.dispatchEvent(new Event('mc:apps-changed'))
       } else {
-        reportInstallFailure(result.error || i18nT('pages.appDetailPage.install_failed'), 'system')
+        reportInstallFailure(result.error || i18nT('pages.appDetailPage.install_failed'), 'system', result.code || '')
         return 'failed'
       }
     } catch (e: unknown) {
@@ -1078,7 +1099,19 @@ export default function AppDetailPage() {
         // silent no-op.
         const outcome = await runInstall()
         if (outcome === 'trust-required') throw new Error(APP_EXECUTION_DENIED)
-        if (outcome !== 'done') throw new Error(i18nT('pages.appDetailPage.install_failed'))
+        // The server's own sentence, so the modal can show WHY instead of only
+        // the generic copy, with the machine code beside it so the modal can tell
+        // a permanent refusal from a failure worth retrying (`errorCode` reads a
+        // direct `code` property). `installFailureRef` holds what
+        // `reportInstallFailure` journaled; an abort reports nothing, so it falls
+        // back to the generic string rather than reusing a stale reason.
+        if (outcome !== 'done') {
+          const { message, code } = installFailureRef.current
+          throw Object.assign(
+            new Error(message || i18nT('pages.appDetailPage.install_failed')),
+            code ? { code } : {},
+          )
+        }
       },
     )
   }
@@ -1265,6 +1298,18 @@ export default function AppDetailPage() {
   // mixed array that the resolver correctly rejects.
   const useCases = appUseCases(app)
   const configuration = appConfiguration(app)
+  // The journal entry behind the current error, when there is one: its `code` is
+  // the `done` payload's machine code, journaled by `reportInstallFailure`, and
+  // it selects the error box's copy below. Looked up by the message, which is
+  // the journal key, so a later unrelated `setError` never inherits an install
+  // failure's code.
+  const errorReport = error ? findReport(error) : undefined
+  // The desktop build-step refusal is permanent for this app as it is: the
+  // Install / Update buttons below are disabled while its banner is up, because
+  // pressing them runs the same clone and build into the same refusal. The
+  // banner's dismiss clears `error`, which is how a retry is reached once the
+  // app's author has shipped the packages.
+  const installRefusedForGood = Boolean(error) && errorReport?.code === DESKTOP_BUILD_STEP_UNSUPPORTED
 
   return (
     <>
@@ -1308,8 +1353,30 @@ export default function AppDetailPage() {
             backend failure, so it renders the prose — better than swallowing
             it — plus the agent hand-off, since raw backend prose is otherwise
             a dead end. The page holds no draft (every action commits on
-            click), so the hand-off is safe. */}
-        <ErrorNotice message={error} askAgent onDismiss={clearError} className="mb-4 animate-rise" />
+            click), so the hand-off is safe.
+
+            One recognized case: the desktop build-step refusal. An app that is
+            ALREADY trusted never opens the consent modal, so its refusal lands
+            here, and the raw sentence alone is developer vocabulary with no hint
+            that retrying is futile. The journal carries the `done` payload's code
+            beside the message (`reportInstallFailure`), so the code the modal
+            keys its copy on is read here too. The headline is this page's own:
+            the modal says the app could not be turned on (its operation), this
+            page says it could not be installed (the button that was pressed);
+            the plain sentence beneath is shared. */}
+        {installRefusedForGood ? (
+          <ErrorNotice
+            title={i18nT('pages.appDetailPage.install_desktop_unsupported')}
+            message={i18nT('components.appstore.trustAppModal.failed_desktop_unsupported_help')}
+            report={errorReport}
+            footer={<span className="font-mono text-[12px]">{error}</span>}
+            askAgent
+            onDismiss={clearError}
+            className="mb-4 animate-rise"
+          />
+        ) : (
+          <ErrorNotice message={error} askAgent onDismiss={clearError} className="mb-4 animate-rise" />
+        )}
 
         {/* Third-party execution-trust consent. Opened when an enable OR a
             registry install is refused with code `app_execution_denied`, instead
@@ -1318,6 +1385,8 @@ export default function AppDetailPage() {
           app={trust.target}
           pending={trust.pending}
           failed={trust.failed}
+          detail={trust.detail}
+          detailCode={trust.detailCode}
           granted={trust.granted}
           onCancel={trust.cancel}
           onConfirm={trust.confirm}
@@ -1405,7 +1474,7 @@ export default function AppDetailPage() {
             {/* Actions */}
             <div className="flex items-center gap-2 flex-wrap">
               {!app.installed && !clientInstall && (
-                <Btn primary onClick={handleInstall} disabled={actionLoading === 'install'}>
+                <Btn primary onClick={handleInstall} disabled={actionLoading === 'install' || installRefusedForGood}>
                   {actionLoading === 'install' ? <><Loader2 size={14} className="animate-spin" /> {i18nT('pages.appDetailPage.installing')}</> : <><Download size={14} /> {i18nT('pages.appDetailPage.install')}</>}
                 </Btn>
               )}
@@ -1441,7 +1510,7 @@ export default function AppDetailPage() {
               {app.installed && isSelfManaged && !isBuiltin && (
                 <>
                   <div className="text-[13px] text-ok flex items-center gap-1.5"><Check size={14} /> {i18nT('pages.appDetailPage.installed_version', { version: app.installedVersion })}</div>
-                  {app.updateAvailable && <Btn onClick={handleInstall} disabled={actionLoading === 'install'} className="!bg-[var(--info)] !text-white hover:!opacity-80">{actionLoading === 'install' ? <><Loader2 size={14} className="animate-spin" /> {i18nT('pages.appDetailPage.updating')}</> : <><ArrowUp size={14} /> {i18nT('pages.appDetailPage.update')}</>}</Btn>}
+                  {app.updateAvailable && <Btn onClick={handleInstall} disabled={actionLoading === 'install' || installRefusedForGood} className="!bg-[var(--info)] !text-white hover:!opacity-80">{actionLoading === 'install' ? <><Loader2 size={14} className="animate-spin" /> {i18nT('pages.appDetailPage.updating')}</> : <><ArrowUp size={14} /> {i18nT('pages.appDetailPage.update')}</>}</Btn>}
                   {canUninstall && <Btn danger onClick={() => handleAction('uninstall')} disabled={actionLoading === 'uninstall'} title={i18nT('pages.appDetailPage.removes_kirocrew_metadata_only_the_app_itself_is')}><Trash2 size={14} /> {i18nT('pages.appDetailPage.uninstall')}</Btn>}
                 </>
               )}
@@ -1475,7 +1544,7 @@ export default function AppDetailPage() {
                   )}
                     </>
                   )}
-                  {canUpdate && app.updateAvailable && <Btn onClick={handleInstall} disabled={actionLoading === 'install'} className="!bg-[var(--info)] !text-white hover:!opacity-80">{actionLoading === 'install' ? <><Loader2 size={14} className="animate-spin" /> {i18nT('pages.appDetailPage.updating')}</> : <><ArrowUp size={14} /> {i18nT('pages.appDetailPage.update')}</>}</Btn>}
+                  {canUpdate && app.updateAvailable && <Btn onClick={handleInstall} disabled={actionLoading === 'install' || installRefusedForGood} className="!bg-[var(--info)] !text-white hover:!opacity-80">{actionLoading === 'install' ? <><Loader2 size={14} className="animate-spin" /> {i18nT('pages.appDetailPage.updating')}</> : <><ArrowUp size={14} /> {i18nT('pages.appDetailPage.update')}</>}</Btn>}
                   {canUpdate && !app.updateAvailable && <Btn onClick={() => handleAction('update')} disabled={actionLoading === 'update'} title={i18nT('pages.appDetailPage.sync_app_from_its_source_directory')}><RefreshCw size={14} /> {i18nT('pages.appDetailPage.sync')}</Btn>}
                   {canUninstall && <Btn danger onClick={() => handleAction('uninstall')} disabled={actionLoading === 'uninstall'}><Trash2 size={14} /> {i18nT('pages.appDetailPage.uninstall')}</Btn>}
                 </>

@@ -681,14 +681,74 @@ install (which clones the app's git source) runs `pip install .` (or
 into the Gateway's own interpreter — the one that imports your hooks (see the
 publishing guide's install flow) — but only when the app's source directory
 (the `subdirectory` when one is declared) has no `package.json`, which takes
-precedence and routes the build to npm instead. Two caveats: the desktop app's
-bundled interpreter fails the build step outright, and a failed `pip` run fails
-the install. A Gateway interpreter with no `pip` module instead logs a soft skip,
-so an app that truly requires those dependencies must detect their absence rather
-than assuming the build ran. An app installed by other means, one whose
-`package.json` routed the build to npm, or one declaring no
+precedence and routes the build to npm instead. Two caveats: a failed `pip` run
+fails the install, and **the desktop app's bundled interpreter cannot be
+installed into at all** — it lives inside the signed application bundle, so on
+that build the step is refused with a loud error for anything that would have to
+land in the Gateway's interpreter (`pyproject.toml`, `setup.py`). A Gateway
+interpreter with no `pip` module instead logs a soft skip, so an app that truly
+requires those dependencies must detect their absence rather than assuming the
+build ran. An app installed by other means, one whose `package.json` routed the
+build to npm, or one declaring no
 `requirements.txt`/`pyproject.toml`/`setup.py` at all, imports only the stdlib
 plus whatever the Gateway's environment already provides.
+
+**The one desktop exception** is a root `requirements.txt` that the runtime
+provisions itself, and it is exactly the runtime's own condition: the app
+declares an out-of-process consumer in a shape the runtime provisions for — a
+**file-style** `backend.entryPoint` (`server.py`, `backend/app.py`), or a stdio
+`mcpServers` entry (one without `url`) — and declares no `backend.hooks`. A
+module-style, dotted entry point (`my_pkg.server`) is trusted package code the
+runtime never installs an app-directory `requirements.txt` for, so it keeps the
+refusal rather than passing an install whose dependencies would land nowhere.
+Those dependencies are not the Gateway's to import: the entry point runs as its
+own process, a stdio server is spawned as its own process, and the runtime
+provisioning above installs that same file into the app's own deps tree when
+the backend spawns or the server is registered — so the install-time step is
+SKIPPED (not refused, and no pip runs) and the runtime owns it. The refusal
+still applies to that app's `pyproject.toml`/`setup.py`, to a `requirements.txt`
+sitting beside either of them, to an app that declares neither consumer (nothing
+would ever provision the file), to an app that ALSO declares a hook — a hook
+is imported into the Gateway process, which the deps tree never reaches, so its
+imports would be broken by an install that reported success — and to a
+**self-managed** registry entry (`resources: "app"`), whatever its manifest
+declares: such an app is registered from its manifest alone (no source is copied
+into the app directory, the Gateway spawns and registers nothing for it, it
+launches itself), so neither provisioner ever runs for it and only the
+install-time step would have installed the file. "Declares a hook"
+is read from the same normalized manifest the Gateway's own loaders are handed,
+so a `hooks` value the manifest parser drops is not one. The `requirements.txt`
+itself must be what the runtime will read: a regular file, or a symlink that
+resolves to a regular file inside the app directory (`requirements.txt ->
+requirements/prod.txt` is fine); a link that leaves the directory, or a
+dangling one, is refused at spawn and therefore refused here too, and so is a
+link whose target the installed copy will not have — under `data/`, which an
+update replaces with your preserved data, or under a name the copy drops at
+any depth (`node_modules`, `.venv`, `.git`, `__pycache__`), a regular file so
+named included, since the copy drops by name whatever the entry's type. A
+directory named `requirements.txt` is nothing the runtime can read and is
+refused too. The same holds for the entry point itself: a `backend.entryPoint`
+under `data/` or one of those names, whether by its declared path or by where a
+link resolves, is not carried into the installed app, so it does not qualify;
+nor does a directory standing where the entry file should be. The verdict
+is derived twice from the same rule: once before the build, and again on the
+final checkout after `setup.onInstall` has run — a script that adds a hook or
+removes the consumer the exception was granted for fails the install with the
+same refusal (an entry file or a link target that does not exist yet — nothing
+at the path, or a link pointing at a target your script has yet to create — is
+let through by the first pass and refused by the final one if it never
+appeared; anything else standing at the path is refused by both), and the
+checkout is rolled back as for any other post-script
+rejection. Build files (`pyproject.toml`, `setup.py`, `requirements.txt`,
+`package.json`) that appeared while the script ran are moved out of the
+checkout into a recoverable `<app>.rejected-<id>` sibling under the app-sources
+directory, named in the install log and kept until you remove it — nothing is
+deleted, since a file that appeared in that window may be yours rather than
+the script's — so a corrected retry is not refused by them. On a
+source install nothing changes — `requirements.txt` is still pip-installed at
+install time — so an app that needs its dependencies importable by hooks must
+ship `pyproject.toml`/`setup.py` and accept that it cannot install on the
+desktop build.
 
 If you create a directory to hold your own dependencies, do **not** name it
 `.venv`. Interpreter resolution (`resolve_app_python`) runs only for spawned

@@ -39,6 +39,7 @@ import pytest
 
 from kiro_crew import platform_compat
 from kiro_crew.apps import registry
+from kiro_crew.apps.manifest import AppManifest
 
 
 @pytest.fixture(autouse=True)
@@ -1975,6 +1976,747 @@ async def test_postscript_admission_rejection_rolls_back_preexisting_checkout(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "script_effect",
+    ["adds_hooks", "drops_the_entry_point"],
+    ids=["onInstall adds backend.hooks", "onInstall drops the entry point"],
+)
+async def test_onInstall_rewriting_the_manifest_loses_the_desktop_requirements_waiver(
+    monkeypatch, tmp_path, script_effect
+):
+    """The bundled-interpreter waiver is re-derived from the FINAL manifest.
+
+    The build judges a requirements-only app on the manifest that entered
+    ``setup.onInstall``; the script then runs with write access to the checkout.
+    One that adds ``backend.hooks`` turns the app into one whose Python imports
+    INTO the gateway (which the runtime-provisioned deps tree never reaches), and
+    one that drops the entry point leaves nothing that would ever provision the
+    file. Either way the waiver's premise is gone, so the install must fail with
+    the gate's own sentence, roll the pre-existing checkout back exactly like a
+    post-script admission denial, and register nothing.
+    """
+    src = tmp_path / "app-sources" / "demoapp"
+    src.mkdir(parents=True)
+    (src / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+    (src / "server.py").write_text("", encoding="utf-8")
+    entering = {
+        "name": "demoapp",
+        "backend": {"entryPoint": "server.py", "type": "asgi"},
+        "setup": {"onInstall": "true"},
+    }
+    (src / "app.json").write_text(json.dumps(entering), encoding="utf-8")
+    monkeypatch.setattr(registry.platform_compat, "is_bundled_interpreter", lambda: True)
+    monkeypatch.setattr(registry, "app_source_dir", lambda n: src)
+    monkeypatch.setattr(registry, "sel", lambda: MagicMock())
+    monkeypatch.setattr(registry, "app_admission_denied", lambda *a, **k: None)
+    monkeypatch.setattr(
+        registry,
+        "get_registry_app",
+        lambda n: {"name": "demoapp", "repo": "https://example.com/demo.git", "branch": "main"},
+    )
+    monkeypatch.setattr(
+        registry,
+        "_fetch_app_manifest",
+        AsyncMock(return_value={"name": "demoapp", "version": "1.0.0"}),
+    )
+    registered: list[str] = []
+
+    def _register(source, **kwargs):
+        # Reached only if the final gate let the install through; the transaction
+        # reports this sentinel as the outcome's error, which the assertions below
+        # then name instead of the refusal.
+        registered.append(str(source))
+        raise RuntimeError("registration reached")
+
+    monkeypatch.setattr(registry, "install_app", _register)
+    monkeypatch.setattr(registry, "update_app", _register)
+
+    async def _fake_clone_build(git_url, app_name, log_lines, branch="main", **kwargs):
+        # The build already granted the waiver on `entering` (an out-of-process
+        # entry point, no hooks); what it returns is the checkout the script gets.
+        return {
+            "ok": True,
+            "pkg_dir": src,
+            "_checkout_preexisted": True,
+            "_pre_pull_commit": "b" * 40,
+        }
+
+    monkeypatch.setattr(registry, "_clone_build_app", _fake_clone_build)
+
+    spawned: list[list[str]] = []
+
+    class _Proc:
+        returncode = 0
+        pid = 4242
+
+        async def communicate(self):
+            return b"", b""
+
+    async def _fake_spawn(*argv, **kwargs):
+        spawned.append(list(argv))
+        if argv[0] == "/bin/bash":
+            # What the script does with its write access: rewrite app.json.
+            rewritten = dict(entering)
+            if script_effect == "adds_hooks":
+                rewritten["backend"] = {
+                    **entering["backend"],
+                    "hooks": {"on_startup": "backend.hooks:start"},
+                }
+            else:
+                rewritten["backend"] = {"type": "asgi"}
+            (src / "app.json").write_text(json.dumps(rewritten), encoding="utf-8")
+        return _Proc()
+
+    monkeypatch.setattr(registry, "create_subprocess_limited", _fake_spawn)
+    monkeypatch.setattr(registry, "wrap_argv", lambda cmd, mode="": (cmd, None))
+    monkeypatch.setattr(registry, "cgroup_scope_argv", lambda cmd: cmd)
+    monkeypatch.setattr(
+        registry.platform_compat, "kill_process_tree_async", AsyncMock(), raising=False
+    )
+    monkeypatch.setattr(registry.os, "killpg", lambda pgid, sig: None, raising=False)
+
+    result = await registry.install_from_registry("demoapp")
+
+    assert result["ok"] is False
+    assert result["error"] == (
+        "Python apps that require a build step are not supported in the desktop app: "
+        "its bundled interpreter is inside the signed application bundle and cannot "
+        "install packages"
+    )
+    assert result["code"] == "desktop_build_step_unsupported"
+    # Nothing registered, nothing enabled: the refusal happens before install_app.
+    assert registered == []
+    # The pre-existing checkout is rolled back the way the post-script admission
+    # denial rolls it back: reset to the pre-pull commit and the manifest restored.
+    assert any(cmd[:4] == ["git", "reset", "--keep", "b" * 40] for cmd in spawned)
+    assert any(
+        cmd[:4] == ["git", "--literal-pathspecs", "checkout", "--"] for cmd in spawned
+    )
+    assert src.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_script_that_leaves_the_waiver_intact_still_installs(monkeypatch, tmp_path):
+    """The final desktop pass repeats the build's verdict on unchanged inputs: a
+    script that touches nothing the waiver depends on does not cost the install."""
+    src = tmp_path / "app-sources" / "demoapp"
+    src.mkdir(parents=True)
+    (src / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+    (src / "server.py").write_text("", encoding="utf-8")
+    (src / "app.json").write_text(
+        json.dumps(
+            {
+                "name": "demoapp",
+                "backend": {"entryPoint": "server.py", "type": "asgi"},
+                "setup": {"onInstall": "true"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(registry.platform_compat, "is_bundled_interpreter", lambda: True)
+    monkeypatch.setattr(registry, "app_source_dir", lambda n: src)
+    monkeypatch.setattr(registry, "sel", lambda: MagicMock())
+    monkeypatch.setattr(registry, "app_admission_denied", lambda *a, **k: None)
+    monkeypatch.setattr(
+        registry,
+        "get_registry_app",
+        lambda n: {"name": "demoapp", "repo": "https://example.com/demo.git", "branch": "main"},
+    )
+    monkeypatch.setattr(
+        registry,
+        "_fetch_app_manifest",
+        AsyncMock(return_value={"name": "demoapp", "version": "1.0.0"}),
+    )
+
+    async def _fake_clone_build(git_url, app_name, log_lines, branch="main", **kwargs):
+        return {"ok": True, "pkg_dir": src, "_checkout_preexisted": False, "_pre_pull_commit": ""}
+
+    monkeypatch.setattr(registry, "_clone_build_app", _fake_clone_build)
+
+    class _Proc:
+        returncode = 0
+        pid = 4242
+
+        async def communicate(self):
+            return b"", b""
+
+    async def _fake_spawn(*argv, **kwargs):
+        return _Proc()
+
+    monkeypatch.setattr(registry, "create_subprocess_limited", _fake_spawn)
+    monkeypatch.setattr(registry, "wrap_argv", lambda cmd, mode="": (cmd, None))
+    monkeypatch.setattr(registry, "cgroup_scope_argv", lambda cmd: cmd)
+    monkeypatch.setattr(
+        registry.platform_compat, "kill_process_tree_async", AsyncMock(), raising=False
+    )
+    monkeypatch.setattr(registry.os, "killpg", lambda pgid, sig: None, raising=False)
+    # The final pass is the LAST gate before registration; stop there and read
+    # whether it let the install through.
+    reached: list[str] = []
+
+    def _install_app(source, **kwargs):
+        reached.append(str(source))
+        raise RuntimeError("stop at registration")
+
+    monkeypatch.setattr(registry, "install_app", _install_app)
+
+    outcome = await registry.install_from_registry("demoapp")
+    # The transaction reports the sentinel as the outcome's error: the flow got
+    # past every gate, the final desktop pass included, and into registration.
+    assert reached == [str(src)]
+    assert outcome["error"] == "stop at registration"
+    assert "code" not in outcome
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "script_creates_entry",
+    [True, False],
+    ids=["onInstall generates server.py", "server.py never appears"],
+)
+async def test_an_entry_file_the_script_generates_is_judged_at_the_final_pass(
+    monkeypatch, tmp_path, script_creates_entry
+):
+    """The build pass runs before ``setup.onInstall``, whose window is where an app
+    may generate its entry file, so a declared ``server.py`` that is absent at
+    build time is let through -- and the final pass, on the post-script checkout,
+    is the one that decides: it reaches registration when the script created the
+    file, and refuses with the gate's own code when nothing did (the spawn would
+    return "entry point not found" before provisioning, so the backend
+    provisioner never runs for that app).
+    """
+    src = tmp_path / "app-sources" / "demoapp"
+    src.mkdir(parents=True)
+    (src / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+    (src / "app.json").write_text(
+        json.dumps(
+            {
+                "name": "demoapp",
+                "backend": {"entryPoint": "server.py", "type": "asgi"},
+                "setup": {"onInstall": "true"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(registry.platform_compat, "is_bundled_interpreter", lambda: True)
+    monkeypatch.setattr(registry, "app_source_dir", lambda n: src)
+    monkeypatch.setattr(registry, "sel", lambda: MagicMock())
+    monkeypatch.setattr(registry, "app_admission_denied", lambda *a, **k: None)
+    monkeypatch.setattr(
+        registry,
+        "get_registry_app",
+        lambda n: {"name": "demoapp", "repo": "https://example.com/demo.git", "branch": "main"},
+    )
+    monkeypatch.setattr(
+        registry,
+        "_fetch_app_manifest",
+        AsyncMock(return_value={"name": "demoapp", "version": "1.0.0"}),
+    )
+    build_verdicts: list[str] = []
+
+    async def _fake_clone_build(git_url, app_name, log_lines, branch="main", **kwargs):
+        # The REAL build-pass verdict, on the checkout as it is before the script.
+        build_verdicts.append(
+            registry._desktop_build_refusal(
+                src, AppManifest.from_dict(json.loads((src / "app.json").read_text("utf-8"))),
+                self_managed=False,
+                final=False,
+            )
+        )
+        return {"ok": True, "pkg_dir": src, "_checkout_preexisted": False, "_pre_pull_commit": ""}
+
+    monkeypatch.setattr(registry, "_clone_build_app", _fake_clone_build)
+
+    class _Proc:
+        returncode = 0
+        pid = 4242
+
+        async def communicate(self):
+            return b"", b""
+
+    async def _fake_spawn(*argv, **kwargs):
+        if argv[0] == "/bin/bash" and script_creates_entry:
+            (src / "server.py").write_text("", encoding="utf-8")
+        return _Proc()
+
+    monkeypatch.setattr(registry, "create_subprocess_limited", _fake_spawn)
+    monkeypatch.setattr(registry, "wrap_argv", lambda cmd, mode="": (cmd, None))
+    monkeypatch.setattr(registry, "cgroup_scope_argv", lambda cmd: cmd)
+    monkeypatch.setattr(
+        registry.platform_compat, "kill_process_tree_async", AsyncMock(), raising=False
+    )
+    monkeypatch.setattr(registry.os, "killpg", lambda pgid, sig: None, raising=False)
+    reached: list[str] = []
+
+    def _install_app(source, **kwargs):
+        reached.append(str(source))
+        raise RuntimeError("stop at registration")
+
+    monkeypatch.setattr(registry, "install_app", _install_app)
+
+    outcome = await registry.install_from_registry("demoapp")
+
+    # The build pass let the absent entry through in both cases.
+    assert build_verdicts == [""]
+    if script_creates_entry:
+        assert reached == [str(src)]
+        assert outcome["error"] == "stop at registration"
+    else:
+        assert reached == []
+        assert outcome["code"] == "desktop_build_step_unsupported"
+
+
+@pytest.mark.asyncio
+async def test_a_self_managed_entry_keeps_the_desktop_refusal(monkeypatch, tmp_path):
+    """The waiver is for apps the runtime provisions, and it never provisions a
+    self-managed one.
+
+    A registry entry with ``resources: "app"`` takes the metadata-only branch:
+    no source is copied into the app directory, the bridges skip every
+    registration for it, and the app launches itself -- so the file-style entry
+    point that waives a gateway-managed app's requirements.txt names a consumer
+    the runtime will never spawn. Ownership is a registry fact, not a manifest
+    one: it reaches the build verdict as its own input and the final pass judges
+    it again, so the install fails with the gate's own sentence and
+    ``register_external_app`` is never reached.
+    """
+    src = tmp_path / "app-sources" / "demoapp"
+    src.mkdir(parents=True)
+    (src / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+    (src / "server.py").write_text("", encoding="utf-8")
+    (src / "app.json").write_text(
+        json.dumps({"name": "demoapp", "backend": {"entryPoint": "server.py", "type": "asgi"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(registry.platform_compat, "is_bundled_interpreter", lambda: True)
+    monkeypatch.setattr(registry, "app_source_dir", lambda n: src)
+    monkeypatch.setattr(registry, "sel", lambda: MagicMock())
+    monkeypatch.setattr(registry, "app_admission_denied", lambda *a, **k: None)
+    monkeypatch.setattr(
+        registry,
+        "get_registry_app",
+        lambda n: {
+            "name": "demoapp",
+            "repo": "https://example.com/demo.git",
+            "branch": "main",
+            "resources": "app",
+        },
+    )
+    monkeypatch.setattr(
+        registry,
+        "_fetch_app_manifest",
+        AsyncMock(return_value={"name": "demoapp", "version": "1.0.0"}),
+    )
+    build_kwargs: list[dict] = []
+
+    async def _fake_clone_build(git_url, app_name, log_lines, branch="main", **kwargs):
+        # Records what the build verdict was told about ownership, and returns
+        # the checkout as if the build had waived: the final pass must still
+        # refuse from the same inputs.
+        build_kwargs.append(kwargs)
+        return {"ok": True, "pkg_dir": src, "_checkout_preexisted": False, "_pre_pull_commit": ""}
+
+    monkeypatch.setattr(registry, "_clone_build_app", _fake_clone_build)
+    registered: list[str] = []
+
+    def _register(**kwargs):
+        registered.append(kwargs["name"])
+        return MagicMock(ok=True, notice="")
+
+    # Imported inside the self-managed branch, so patched at its home.
+    monkeypatch.setattr("kiro_crew.apps.manager.register_external_app", _register)
+    monkeypatch.setattr(registry, "set_app_provenance", lambda *a, **k: None)
+    monkeypatch.setattr(registry.install_receipt, "dispatch_async", AsyncMock())
+    monkeypatch.setattr(registry, "install_app", lambda *a, **k: pytest.fail("managed path"))
+
+    result = await registry.install_from_registry("demoapp")
+
+    assert build_kwargs and build_kwargs[0]["self_managed"] is True
+    assert result["ok"] is False
+    assert result["error"] == (
+        "Python apps that require a build step are not supported in the desktop app: "
+        "its bundled interpreter is inside the signed application bundle and cannot "
+        "install packages"
+    )
+    assert result["code"] == "desktop_build_step_unsupported"
+    assert registered == []
+
+
+@pytest.mark.asyncio
+async def test_a_final_desktop_refusal_sets_aside_the_layout_files_that_appeared(
+    monkeypatch, tmp_path
+):
+    """The rollback leaves the build gate's inputs as they were before the script,
+    without deleting anything a person may have saved.
+
+    ``setup.onInstall`` runs with write access to a PRE-EXISTING checkout. A
+    ``pyproject.toml`` it creates fails the final desktop pass -- and it is
+    untracked, so the post-refusal ``git reset --keep`` leaves it in place, where
+    every retry would refuse at the BUILD gate before the script a fixed remote
+    corrected could run again. But a file that appeared in the same window is
+    not necessarily the script's: here a stand-in person saves ``setup.py`` into
+    the app directory while the install runs. Neither can be told apart
+    afterwards, so both are moved -- intact -- into a recoverable
+    ``<clone>.rejected-<hex>`` sibling that the install log names, the checkout
+    is left as it was before the script, and the files that predate the script
+    stay where they are.
+    """
+    sources = tmp_path / "app-sources"
+    src = sources / "demoapp"
+    src.mkdir(parents=True)
+    (src / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+    (src / "server.py").write_text("", encoding="utf-8")
+    (src / "NOTES.md").write_text("mine\n", encoding="utf-8")
+    entering = {
+        "name": "demoapp",
+        "backend": {"entryPoint": "server.py", "type": "asgi"},
+        "setup": {"onInstall": "true"},
+    }
+    (src / "app.json").write_text(json.dumps(entering), encoding="utf-8")
+    monkeypatch.setattr(registry.platform_compat, "is_bundled_interpreter", lambda: True)
+    monkeypatch.setattr(registry, "app_source_dir", lambda n: src)
+    monkeypatch.setattr(registry, "sel", lambda: MagicMock())
+    monkeypatch.setattr(registry, "app_admission_denied", lambda *a, **k: None)
+    monkeypatch.setattr(
+        registry,
+        "get_registry_app",
+        lambda n: {"name": "demoapp", "repo": "https://example.com/demo.git", "branch": "main"},
+    )
+    monkeypatch.setattr(
+        registry,
+        "_fetch_app_manifest",
+        AsyncMock(return_value={"name": "demoapp", "version": "1.0.0"}),
+    )
+    monkeypatch.setattr(registry, "install_app", lambda *a, **k: pytest.fail("registered"))
+
+    async def _fake_clone_build(git_url, app_name, log_lines, branch="main", **kwargs):
+        return {
+            "ok": True,
+            "pkg_dir": src,
+            "_checkout_preexisted": True,
+            "_pre_pull_commit": "b" * 40,
+        }
+
+    monkeypatch.setattr(registry, "_clone_build_app", _fake_clone_build)
+
+    class _Proc:
+        returncode = 0
+        pid = 4242
+
+        async def communicate(self):
+            return b"", b""
+
+    async def _fake_spawn(*argv, **kwargs):
+        if argv[0] == "/bin/bash":
+            # The script: a build file that installs INTO the interpreter, which
+            # the final pass refuses.
+            (src / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+            # The person, in the same window: a file of their own, saved into the
+            # app directory. Indistinguishable from the script's afterwards.
+            (src / "setup.py").write_text("# my work in progress\n", encoding="utf-8")
+        # `git reset --keep` is recorded, not run: it restores tracked files only,
+        # and both new files are untracked either way.
+        return _Proc()
+
+    monkeypatch.setattr(registry, "create_subprocess_limited", _fake_spawn)
+    monkeypatch.setattr(registry, "wrap_argv", lambda cmd, mode="": (cmd, None))
+    monkeypatch.setattr(registry, "cgroup_scope_argv", lambda cmd: cmd)
+    monkeypatch.setattr(
+        registry.platform_compat, "kill_process_tree_async", AsyncMock(), raising=False
+    )
+    monkeypatch.setattr(registry.os, "killpg", lambda pgid, sig: None, raising=False)
+
+    # The streaming install hands `install_from_registry` a StreamingLogLines,
+    # whose append feeds a loop-owned asyncio.Queue: it must only ever be called
+    # on the event-loop thread, so the set-aside step (a worker-thread rename)
+    # has to hand its lines back instead of appending them itself.
+    loop_thread = threading.get_ident()
+
+    class _ThreadCheckedLog(registry.StreamingLogLines):
+        off_loop: list[str] = []
+
+        def append(self, line: str) -> None:
+            if threading.get_ident() != loop_thread:
+                self.off_loop.append(line)
+            super().append(line)
+
+    log_lines = _ThreadCheckedLog(asyncio.Queue())
+
+    result = await registry.install_from_registry("demoapp", log_lines=log_lines)
+
+    assert result["code"] == "desktop_build_step_unsupported"
+    assert _ThreadCheckedLog.off_loop == []
+    # The checkout is as it was before the script: neither new file wedges the
+    # build gate on the next attempt, and what predates the script is untouched.
+    assert not (src / "pyproject.toml").exists()
+    assert not (src / "setup.py").exists()
+    assert (src / "requirements.txt").is_file()
+    assert (src / "server.py").is_file()
+    assert (src / "NOTES.md").read_text(encoding="utf-8") == "mine\n"
+    # Nothing was deleted: both files sit, intact, in one recoverable sibling of
+    # the clone that the retention sweep never touches (it may hold the person's
+    # only copy), and the log names the paths.
+    asides = [p for p in sources.iterdir() if p.name.startswith("demoapp.rejected-")]
+    assert len(asides) == 1
+    aside = asides[0]
+    assert not registry._is_stale_candidate(aside)
+    assert (aside / "setup.py").read_text(encoding="utf-8") == "# my work in progress\n"
+    assert (aside / "pyproject.toml").read_text(encoding="utf-8") == "[project]\n"
+    log = result["log"]
+    assert (
+        f"Set aside setup.py, which appeared during the install script, at {aside / 'setup.py'} "
+        "(kept there until you remove it)"
+    ) in log
+    assert str(aside / "pyproject.toml") in log
+
+
+@pytest.mark.asyncio
+async def test_the_set_aside_runs_before_the_rollback_restores_tracked_files(
+    monkeypatch, tmp_path
+):
+    """Order matters: ``git reset --keep`` can RESTORE a tracked layout file the
+    pull had removed -- absent in the pre-script snapshot, present after the
+    reset. A scan run after the reset would mistake that restored file for one
+    that appeared during the script and move the freshly restored checkout's own
+    file out of it. So the scan and the moves run first, on exactly the window
+    between snapshot and refusal, and the rollback runs after.
+
+    Here the pre-pull checkout carried ``pyproject.toml`` (a source install's
+    layout), the update removed it, the script created ``setup.py``, and the
+    final pass refuses ``setup.py``. The rollback puts ``pyproject.toml`` back;
+    it must still be there afterwards, with only ``setup.py`` set aside.
+    """
+    sources = tmp_path / "app-sources"
+    src = sources / "demoapp"
+    src.mkdir(parents=True)
+    (src / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+    (src / "server.py").write_text("", encoding="utf-8")
+    entering = {
+        "name": "demoapp",
+        "backend": {"entryPoint": "server.py", "type": "asgi"},
+        "setup": {"onInstall": "true"},
+    }
+    (src / "app.json").write_text(json.dumps(entering), encoding="utf-8")
+    monkeypatch.setattr(registry.platform_compat, "is_bundled_interpreter", lambda: True)
+    monkeypatch.setattr(registry, "app_source_dir", lambda n: src)
+    monkeypatch.setattr(registry, "sel", lambda: MagicMock())
+    monkeypatch.setattr(registry, "app_admission_denied", lambda *a, **k: None)
+    monkeypatch.setattr(
+        registry,
+        "get_registry_app",
+        lambda n: {"name": "demoapp", "repo": "https://example.com/demo.git", "branch": "main"},
+    )
+    monkeypatch.setattr(
+        registry,
+        "_fetch_app_manifest",
+        AsyncMock(return_value={"name": "demoapp", "version": "1.0.0"}),
+    )
+    monkeypatch.setattr(registry, "install_app", lambda *a, **k: pytest.fail("registered"))
+
+    async def _fake_clone_build(git_url, app_name, log_lines, branch="main", **kwargs):
+        return {
+            "ok": True,
+            "pkg_dir": src,
+            "_checkout_preexisted": True,
+            "_pre_pull_commit": "b" * 40,
+        }
+
+    monkeypatch.setattr(registry, "_clone_build_app", _fake_clone_build)
+
+    class _Proc:
+        returncode = 0
+        pid = 4242
+
+        async def communicate(self):
+            return b"", b""
+
+    async def _fake_spawn(*argv, **kwargs):
+        if argv[0] == "/bin/bash":
+            (src / "setup.py").write_text("from setuptools import setup\n", encoding="utf-8")
+        if list(argv[:3]) == ["git", "reset", "--keep"]:
+            # What the rollback does to TRACKED files: the pre-pull commit had a
+            # pyproject.toml the pull removed, and the reset puts it back.
+            (src / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+        return _Proc()
+
+    monkeypatch.setattr(registry, "create_subprocess_limited", _fake_spawn)
+    monkeypatch.setattr(registry, "wrap_argv", lambda cmd, mode="": (cmd, None))
+    monkeypatch.setattr(registry, "cgroup_scope_argv", lambda cmd: cmd)
+    monkeypatch.setattr(
+        registry.platform_compat, "kill_process_tree_async", AsyncMock(), raising=False
+    )
+    monkeypatch.setattr(registry.os, "killpg", lambda pgid, sig: None, raising=False)
+
+    result = await registry.install_from_registry("demoapp")
+
+    assert result["code"] == "desktop_build_step_unsupported"
+    # The restored tracked file is exactly where the rollback put it.
+    assert (src / "pyproject.toml").read_text(encoding="utf-8") == "[project]\n"
+    # Only what appeared during the script left the checkout.
+    assert not (src / "setup.py").exists()
+    asides = [p for p in sources.iterdir() if p.name.startswith("demoapp.rejected-")]
+    assert len(asides) == 1
+    assert sorted(p.name for p in asides[0].iterdir()) == ["setup.py"]
+
+
+def _fresh_checkout_refused_by_the_final_pass(monkeypatch, tmp_path):
+    """Shared fixture: a FRESH clone whose ``setup.onInstall`` creates a file the
+    final desktop pass refuses. Returns (sources, src)."""
+    sources = tmp_path / "app-sources"
+    src = sources / "demoapp"
+    src.mkdir(parents=True)
+    (src / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+    (src / "server.py").write_text("", encoding="utf-8")
+    (src / "app.json").write_text(
+        json.dumps(
+            {
+                "name": "demoapp",
+                "backend": {"entryPoint": "server.py", "type": "asgi"},
+                "setup": {"onInstall": "true"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(registry.platform_compat, "is_bundled_interpreter", lambda: True)
+    monkeypatch.setattr(registry, "app_source_dir", lambda n: src)
+    monkeypatch.setattr(registry, "sel", lambda: MagicMock())
+    monkeypatch.setattr(registry, "app_admission_denied", lambda *a, **k: None)
+    monkeypatch.setattr(
+        registry,
+        "get_registry_app",
+        lambda n: {"name": "demoapp", "repo": "https://example.com/demo.git", "branch": "main"},
+    )
+    monkeypatch.setattr(
+        registry,
+        "_fetch_app_manifest",
+        AsyncMock(return_value={"name": "demoapp", "version": "1.0.0"}),
+    )
+    monkeypatch.setattr(registry, "install_app", lambda *a, **k: pytest.fail("registered"))
+
+    async def _fake_clone_build(git_url, app_name, log_lines, branch="main", **kwargs):
+        return {"ok": True, "pkg_dir": src, "_checkout_preexisted": False, "_pre_pull_commit": ""}
+
+    monkeypatch.setattr(registry, "_clone_build_app", _fake_clone_build)
+
+    class _Proc:
+        returncode = 0
+        pid = 4242
+
+        async def communicate(self):
+            return b"", b""
+
+    async def _fake_spawn(*argv, **kwargs):
+        if argv[0] == "/bin/bash":
+            # The person's own save during the window, as far as anyone can tell.
+            (src / "setup.py").write_text("# my work in progress\n", encoding="utf-8")
+        return _Proc()
+
+    monkeypatch.setattr(registry, "create_subprocess_limited", _fake_spawn)
+    monkeypatch.setattr(registry, "wrap_argv", lambda cmd, mode="": (cmd, None))
+    monkeypatch.setattr(registry, "cgroup_scope_argv", lambda cmd: cmd)
+    monkeypatch.setattr(
+        registry.platform_compat, "kill_process_tree_async", AsyncMock(), raising=False
+    )
+    monkeypatch.setattr(registry.os, "killpg", lambda pgid, sig: None, raising=False)
+    return sources, src
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_checkout_s_appeared_file_is_set_aside_before_the_clone_is_deleted(
+    monkeypatch, tmp_path
+):
+    """A FRESH clone is deleted whole by the rollback -- so a file that appeared
+    during the script must leave it first, or the deletion takes the person's
+    only copy with it. The sibling is the same recoverable `.rejected-*`."""
+    sources, src = _fresh_checkout_refused_by_the_final_pass(monkeypatch, tmp_path)
+
+    result = await registry.install_from_registry("demoapp")
+
+    assert result["code"] == "desktop_build_step_unsupported"
+    assert not src.exists()  # the fresh clone was rolled back (deleted) as before
+    asides = [p for p in sources.iterdir() if p.name.startswith("demoapp.rejected-")]
+    assert len(asides) == 1
+    assert (asides[0] / "setup.py").read_text(encoding="utf-8") == "# my work in progress\n"
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_checkout_is_retained_when_an_appeared_file_cannot_be_set_aside(
+    monkeypatch, tmp_path
+):
+    """When the move fails, the appeared file is still inside the clone, and
+    deleting the clone would delete it: the checkout is retained (the next
+    attempt updates it in place) and the log says why. The refusal stands."""
+    sources, src = _fresh_checkout_refused_by_the_final_pass(monkeypatch, tmp_path)
+    real_rename = registry.os.rename
+
+    # The seam is `os.rename`, the one call the set-aside makes per file; the
+    # refusal is matched by NAME (`os.path.basename`), never by a separator-bearing
+    # suffix, so it fires on Windows paths as it does on POSIX ones.
+    def _rename_refused(source, dest, *args, **kwargs):
+        if os.path.basename(source) == "setup.py":
+            raise PermissionError(13, "Operation not permitted", str(source))
+        return real_rename(source, dest, *args, **kwargs)
+
+    monkeypatch.setattr(registry.os, "rename", _rename_refused)
+
+    result = await registry.install_from_registry("demoapp")
+
+    assert result["code"] == "desktop_build_step_unsupported"
+    assert (src / "setup.py").read_text(encoding="utf-8") == "# my work in progress\n"
+    assert "Retaining the checkout" in result["log"]
+    assert "could not set aside setup.py" in result["log"]
+
+
+@pytest.mark.asyncio
+async def test_a_replacement_that_cannot_shed_its_appeared_file_is_parked_whole_not_swept(
+    monkeypatch, tmp_path
+):
+    """When the fresh clone REPLACED a moved-aside previous checkout, the
+    transaction's `finally` puts that one back and renames whatever occupies the
+    slot to a `.partial-*` sibling -- which the retention sweep deletes, taking
+    the appeared file with it. So the replacement is renamed first, whole, to a
+    `.rejected-*` sibling the sweep never touches; the previous checkout is then
+    restored into the empty slot, and no `.partial-*` is left behind."""
+    sources, src = _fresh_checkout_refused_by_the_final_pass(monkeypatch, tmp_path)
+    previous = sources / "demoapp.stale-deadbeef"
+    previous.mkdir()
+    (previous / "MINE.md").write_text("previous checkout\n", encoding="utf-8")
+
+    async def _fake_clone_build(git_url, app_name, log_lines, branch="main", **kwargs):
+        return {
+            "ok": True,
+            "pkg_dir": src,
+            "_checkout_preexisted": False,
+            "_pre_pull_commit": "",
+            "_pending_stale_cleanup": [previous],
+            "_restorable_stale": [previous],
+        }
+
+    monkeypatch.setattr(registry, "_clone_build_app", _fake_clone_build)
+    real_rename = registry.os.rename
+
+    def _rename_refused(source, dest, *args, **kwargs):
+        if os.path.basename(source) == "setup.py":  # by name: fires on Windows paths too
+            raise PermissionError(13, "Operation not permitted", str(source))
+        return real_rename(source, dest, *args, **kwargs)
+
+    monkeypatch.setattr(registry.os, "rename", _rename_refused)
+
+    result = await registry.install_from_registry("demoapp")
+
+    assert result["code"] == "desktop_build_step_unsupported"
+    # The previous checkout is back in the slot.
+    assert (src / "MINE.md").read_text(encoding="utf-8") == "previous checkout\n"
+    # The replacement, appeared file inside, sits in a never-swept sibling.
+    rejected = [p for p in sources.iterdir() if p.name.startswith("demoapp.rejected-")]
+    assert len(rejected) == 1
+    assert (rejected[0] / "setup.py").read_text(encoding="utf-8") == "# my work in progress\n"
+    assert not registry._is_stale_candidate(rejected[0])
+    assert not [p for p in sources.iterdir() if ".partial-" in p.name]
+    assert "Set aside the whole replacement checkout" in result["log"]
+
+
+@pytest.mark.asyncio
 async def test_moveaside_reclone_retained_not_restored_on_rejection(monkeypatch, tmp_path):
     """When the origin-mismatch gate moves an old checkout aside and
     fresh-clones, a rejection must delete the fresh re-clone (never preserve it
@@ -3247,7 +3989,9 @@ async def test_python_build_uses_the_running_interpreter_not_path_pip(tmp_path, 
     # A PATH pip that is emphatically not us — the old code would have used it.
     monkeypatch.setattr(registry.shutil, "which", lambda name: f"/usr/bin/{name}")
 
-    await registry._run_app_build(tmp_path, "x", [])
+    await registry._run_app_build(
+        tmp_path, "x", [], manifest=AppManifest.from_dict({}), self_managed=False
+    )
 
     assert captured, "a pyproject.toml must produce a build command"
     argv = captured[0]
@@ -3288,7 +4032,9 @@ async def test_python_build_soft_skips_when_the_interpreter_has_no_pip(tmp_path,
 
     monkeypatch.setattr(registry.importlib.util, "find_spec", _no_pip)
 
-    result = await registry._run_app_build(tmp_path, "x", log_lines)
+    result = await registry._run_app_build(
+        tmp_path, "x", log_lines, manifest=AppManifest.from_dict({}), self_managed=False
+    )
 
     assert result == {"ok": True}, f"a pip-less interpreter must soft-skip, got {result}"
     assert captured == [], f"no build command may be planned, got {captured}"
@@ -3307,9 +4053,15 @@ async def test_a_monorepo_subdirectory_is_built_not_the_clone_root(tmp_path, mon
     ok=True having installed nothing.
     """
     captured: list = []
+    manifests: list = []
 
-    async def _fake_build(build_dir, app_name, log_lines):
+    async def _fake_build(build_dir, app_name, log_lines, *, manifest, self_managed):
         captured.append(build_dir)
+        # The build's desktop gate decides from the manifest the identity gate
+        # already read, so the caller must hand that over rather than re-reading
+        # an app-writable file -- and from the entry's ownership, which no
+        # manifest field carries.
+        manifests.append(manifest)
         return {"ok": True}
 
     async def _fake_clone(git_url, branch, pkg_dir, log_lines, **kwargs):
@@ -3339,6 +4091,9 @@ async def test_a_monorepo_subdirectory_is_built_not_the_clone_root(tmp_path, mon
     assert (
         captured[0].name == "my-tool" and captured[0].parent.name == "apps"
     ), f"build ran in {captured[0]} — expected the declared subdirectory"
+    assert [m.name for m in manifests] == ["my-tool"], (
+        f"the build must receive the cloned manifest, got {manifests}"
+    )
 
 
 @pytest.mark.asyncio
