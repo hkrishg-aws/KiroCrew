@@ -8370,7 +8370,7 @@
       "dictation_kept_for_model": "Tu dictado se conserva y se transcribirá.",
       "recording": "Grabando",
       "waiting_for_speech_model": "Esperando el modelo de voz.",
-      "discard_dictation": "Descartar"
+      "discard_dictation": "Descartar el dictado"
     },
     "webAppArtifactCard": {
       "acct": "cuenta",

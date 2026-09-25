@@ -686,7 +686,22 @@ export function useComposerVoice(host: ComposerVoiceHost) {
   // Uses voiceRef.current (not `voice`) so this prop stays referentially stable
   // and does not re-render the composer every render — matching toggleVoice.
   const cancelVoice = useCallback(() => {
-    if (streamEnabledRef.current) {
+    // Which utterance this discard is ending is answered by the SESSION in
+    // flight, `voice.transport`, and only then by the saved mode. The mode
+    // describes the utterance the user will start next, and the two come apart
+    // exactly where it costs the most: turning streaming off mid-capture is
+    // converted by the engine's own effect into a drain, so the socket is still
+    // the live session while the mode already reads batch. Gated on the mode
+    // alone, this discard closed that socket and left the words it had promised
+    // to take back sitting in the draft.
+    //
+    // The mode is kept as the second term rather than replaced, because a final
+    // can still be in transit in the instant after the engine clears its own
+    // flags, and then the mode is the only signal left that one is coming. Both
+    // terms only ever WIDEN what is disarmed, which costs nothing: a batch
+    // transcript is exempt from `sttDisarmedRef` by design, and the removal below
+    // verifies its own ground before touching a character.
+    if (voiceRef.current.transport === 'stream' || streamEnabledRef.current) {
       sttDisarmedRef.current = true
       // Remove the dictated region at the frozenInputRef boundary, preserving
       // the pre-dictation text EXACTLY (including its own trailing whitespace)
@@ -876,6 +891,11 @@ export function composerVoiceInputProps(cv: ComposerVoice) {
   return {
     voiceRecording: voiceOwned && voice.recording,
     voiceTranscribing: voiceOwned && voice.transcribing,
+    /* Whether the utterance in flight can still be called off, read from its own
+       transport rather than from the streaming setting — the setting describes
+       the next utterance, so it cannot carry a live obligation. Ownership-gated
+       like the rest: a composer answers for its own dictation only. */
+    voiceDrainCancellable: voiceOwned && voice.drainCancellable,
     /* Ungated: `startVoice` refuses on `voice.transcribing` outright, so the
        voice controls have to read the same global fact. */
     voiceTranscribeActive: voice.transcribing,

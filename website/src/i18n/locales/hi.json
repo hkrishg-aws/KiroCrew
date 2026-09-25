@@ -8255,7 +8255,7 @@
       "dictation_kept_for_model": "तुम्हारा डिक्टेशन सुरक्षित है और बाद में ट्रांसक्राइब किया जाएगा।",
       "recording": "रिकॉर्डिंग",
       "waiting_for_speech_model": "स्पीच मॉडल की प्रतीक्षा है।",
-      "discard_dictation": "रद्द करें"
+      "discard_dictation": "डिक्टेशन को छोड़ दो"
     },
     "webAppArtifactCard": {
       "acct": "खाता",

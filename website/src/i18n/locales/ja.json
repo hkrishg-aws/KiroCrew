@@ -8140,7 +8140,7 @@
       "dictation_kept_for_model": "録音した音声は保持され、文字起こしされます。",
       "recording": "録音中",
       "waiting_for_speech_model": "音声モデルを待機しています。",
-      "discard_dictation": "破棄"
+      "discard_dictation": "口述を破棄"
     },
     "webAppArtifactCard": {
       "acct": "アカウント",

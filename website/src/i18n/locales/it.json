@@ -8370,7 +8370,7 @@
       "dictation_kept_for_model": "La tua dettatura è conservata e verrà trascritta.",
       "recording": "Registrazione",
       "waiting_for_speech_model": "In attesa del modello vocale.",
-      "discard_dictation": "Scarta"
+      "discard_dictation": "Scarta la dettatura"
     },
     "webAppArtifactCard": {
       "acct": "account",

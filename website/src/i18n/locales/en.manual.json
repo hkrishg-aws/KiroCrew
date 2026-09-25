@@ -2921,7 +2921,7 @@
       "default_microphone": "Default microphone",
       "dictation_kept_for_model": "Your dictation is kept and will be transcribed.",
       "waiting_for_speech_model": "Waiting for the speech model.",
-      "discard_dictation": "Discard"
+      "discard_dictation": "Discard dictation"
     },
     "webAppArtifactCard": {
       "api_app": "API app",

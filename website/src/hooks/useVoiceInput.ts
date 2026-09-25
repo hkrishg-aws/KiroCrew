@@ -215,6 +215,31 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
     if (!streamEnabled && streamRecording) streamStop()
   }, [streamEnabled, streamRecording, streamStop])
 
+  /**
+   * Which transport THIS hook's own utterance is in flight on, or null when it
+   * has none.
+   *
+   * `streamEnabled` cannot answer this. It is the saved preference, so it
+   * describes the transport the NEXT utterance will take; flip it while one
+   * utterance is open and it names a transport nothing in flight is using. A
+   * discard routed off it then lands on the wrong path — closing a socket that
+   * was never opened, or skipping the flag that drops a blob still on its way to
+   * the transcriber — and the press changes the UI while the utterance survives.
+   *
+   * Only first-hand signals count: this hook's own socket
+   * (`streamRecording`/`streamDraining`) and its own recorder (`recording`).
+   * `transcribing` is deliberately NOT read here, because the inbox raises it for
+   * whatever request is on display, including one another composer started —
+   * routing a discard off someone else's request is how a press aimed at a
+   * startup of ours would go to the wrong mechanism.
+   */
+  const ownTransport: TranscriptOrigin | null =
+    streamRecording || streamDraining ? 'stream' : recording ? 'batch' : null
+  // Read inside `cancel()`, which fires from a keystroke or a press rather than
+  // from a render, so it must see the transport as of that moment.
+  const ownTransportRef = useRef(ownTransport)
+  ownTransportRef.current = ownTransport
+
   const stopStream = useCallback(() => {
     if (warmTimerRef.current) { clearTimeout(warmTimerRef.current); warmTimerRef.current = null }
     levelStopRef.current?.()
@@ -560,7 +585,14 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
     startGenRef.current++
     startingRef.current = false
     setPartial('')
-    if (streamEnabled) { streamCancel(); setSessionOwner(null); return }
+    // Routed on the utterance in flight, never on the preference: a preference
+    // flipped mid-utterance would otherwise send the discard down the other
+    // transport's path, where it closes a socket that was never opened and
+    // leaves the blob it should have dropped on its way to the transcriber.
+    // With nothing of ours in flight there is no transport to read, and the press
+    // is disarming a startup or a warm mic, which the preference does describe.
+    const transport = ownTransportRef.current
+    if (transport ? transport === 'stream' : streamEnabled) { streamCancel(); setSessionOwner(null); return }
     if (mediaRef.current?.state === 'recording') {
       // onstop drops the blob (see discardRef) and tears down the meter + stream.
       discardRef.current = true
@@ -621,5 +653,22 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
   /** True when `switchDevice` takes effect immediately rather than next recording. */
   const deviceSwitchIsLive = streamEnabled && streamRecording
 
-  return { recording: isRecording, transcribing: transcribing || !!streamDraining, sessionOwner, streamEnabled, toggle, start, stop, cancel, prewarm, error, level, deviceLabel, deviceId, clearError, partial, download, sampleRef, switchDevice, deviceSwitchIsLive }
+  /**
+   * Can the utterance in flight still be called off?
+   *
+   * Answered from the ACTIVE transport, so a preference flipped mid-request
+   * cannot make it lie. Streaming is the one transport whose drain can be ended:
+   * the audio is held against a socket this hook owns, so `cancel()` closes it
+   * and the final never arrives. Batch has no drain to end — capture is over and
+   * the blob is already POSTed, so `cancel()` reaches nothing on the wire and the
+   * transcript lands anyway. A batch dictation is discardable only while its
+   * capture still runs, which is a different window from this one.
+   *
+   * So `streamDraining` IS the whole answer, and reading it here rather than in
+   * the UI keeps the rule beside `cancel()`, whose routing decides whether a
+   * press does anything at all.
+   */
+  const drainCancellable = !!streamDraining
+
+  return { recording: isRecording, transcribing: transcribing || !!streamDraining, transport: ownTransport, drainCancellable, sessionOwner, streamEnabled, toggle, start, stop, cancel, prewarm, error, level, deviceLabel, deviceId, clearError, partial, download, sampleRef, switchDevice, deviceSwitchIsLive }
 }

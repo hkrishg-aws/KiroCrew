@@ -8485,7 +8485,7 @@
       "dictation_kept_for_model": "Записанная речь сохранена и будет расшифрована.",
       "recording": "Запись",
       "waiting_for_speech_model": "Ожидание речевой модели.",
-      "discard_dictation": "Отменить"
+      "discard_dictation": "Отменить диктовку"
     },
     "webAppArtifactCard": {
       "acct": "аккаунт",

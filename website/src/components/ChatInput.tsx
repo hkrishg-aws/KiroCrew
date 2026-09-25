@@ -1037,6 +1037,7 @@ function ChatInput({
     voiceDeviceSwitchIsLive = false,
     voiceTranscribing = false,
     voiceTranscribeActive,
+    voiceDrainCancellable = false,
     voiceBusyElsewhere = false,
     voiceBusyElsewhereSession = null,
     voiceHeldLanded = false,
@@ -4168,17 +4169,20 @@ function ChatInput({
         ) : (
           <VoiceStatusBar
             recording={voiceRecording} level={voiceLevel} deviceLabel={voiceDeviceLabel} deviceId={voiceDeviceId} error={voiceError} onDismissError={onClearVoiceError} onSelectDevice={onSelectVoiceDevice || noopSelectDevice} deviceSwitchIsLive={voiceDeviceSwitchIsLive} download={voiceDownload}
-            /* The released utterance's own window. `voiceStreaming` is part of
-               the condition because only a streaming session can still be called
-               off: its audio is held against an open socket and the discard
-               closes it. A batch transcription is already in the transcriber's
-               hands over HTTP, so the strip offers it no exit rather than an exit
-               that leaves the work running.
+            /* The released utterance's own window. Gated on the transport of the
+               request IN FLIGHT, which is what `voiceDrainCancellable` reads: a
+               streaming drain is held against an open socket and the discard
+               closes it, while a batch transcription is already in the
+               transcriber's hands over HTTP and the strip offers it no exit
+               rather than an exit that leaves the work running.
 
-               Ownership-gated through `voiceTranscribing`, so a composer offers
-               the discard for its OWN drain and never for a session another chat
-               holds. */
-            draining={voiceStreaming && voiceTranscribing}
+               Not on `voiceStreaming`. That is the saved setting, so it describes
+               the NEXT utterance; a setting flipped while one request is open
+               names a transport nothing in flight is using, and the control then
+               appears over a batch request whose transcript still lands. The flag
+               is ownership-gated at its source, so a composer offers the discard
+               for its OWN drain and never for a session another chat holds. */
+            draining={voiceDrainCancellable}
             onCancelDrain={onVoiceCancel}
             /* Visible reasons, not tooltips: why the mic is blocked, or that a
                held dictation just arrived. Only while the mic is offered at all.
