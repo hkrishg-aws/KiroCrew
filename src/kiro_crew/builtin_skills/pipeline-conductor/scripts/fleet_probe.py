@@ -19,7 +19,8 @@ Config (JSON):
       "banned_process_res": [...], # cmdline regexes for banned ops (optional)
       "init_timeout_res": [...],   # initialize-timeout tails (optional)
       "watchdog_res": [...],       # turn-ended-by-stall-watchdog tails (optional)
-      "fleet_worktrees": [...]     # absolute roots this fleet owns (optional)
+      "fleet_worktrees": [...],    # absolute roots this fleet owns (optional)
+      "argv_runner_detection": true # false switches OFF the argv-side runner shape
     }
 
 Every regex key is validated at load time: a bad pattern is malformed config
@@ -66,8 +67,8 @@ Metadata only, by design: transcript-derived text never appears in the output,
 so no private session content crosses into the caller's context whatever keys
 the config watches. Content, when a ruling needs it, is read through the
 workspace-authorized session tools.
-    BANNED pid=<pid> rule=<regex> cwd=fleet|unknown age=<secs|?>s scope=suite|paths|unknown
-       cmd=<program,flags,+withheld>
+    BANNED pid=<pid> rule=<regex|argv:<shape>> cwd=fleet|unknown age=<secs|?>s
+       scope=suite|paths|unknown cmd=<program,flags,+withheld>
     OK <n> watched, <m> fired | load/cpu <x> (<posture>) | mem <G>G
        | banned <k> | foreign <k> | deliver init-timeout <a>, watchdog <b>
 
@@ -349,7 +350,9 @@ DEFAULT_BANNED_RES = (
 )
 
 #: Token bases that identify the test runner inside a ``/proc`` argv.
-_RUNNER_BASES = frozenset({"pytest", "pytest.exe", "py.test", "vitest", "vitest.cmd"})
+_RUNNER_BASES = frozenset(
+    {"pytest", "pytest.exe", "py.test", "py.test.exe", "vitest", "vitest.cmd"}
+)
 
 #: A versioned runner alias, as a whole argv TOKEN base: ``pytest-3``,
 #: ``pytest-3.12``, ``py.test-3``. Distributions install the runner under this name
@@ -366,14 +369,27 @@ _RUNNER_BASES = frozenset({"pytest", "pytest.exe", "py.test", "vitest", "vitest.
 #: on the argv side only, by ``_argv_is_uncapped_argv_only_runner``.
 _ALIAS_RUNNER_BASE_RE = re.compile(r"^(?:pytest|py\.test)-\d+(?:\.\d+)*(?:\.exe)?$")
 
-#: The other runner spelling the joined-line rule cannot express. ``py.test`` is the
-#: legacy entry point and is already in ``_RUNNER_BASES`` -- this file treats it as a
-#: runner everywhere the argv is read -- but no rule above spells it, so an uncapped
-#: ``py.test test/`` is reported by neither. It is admitted on the argv side with the
-#: versioned alias because it needs the same two things and for the same reason: the
-#: dot makes it a plausible FILENAME (``py.test.log``), so only its position separates
-#: an invocation from data.
-_ARGV_ONLY_RUNNER_BASES = frozenset({"py.test", "py.test.exe"})
+#: The other runner spellings the joined-line rule cannot express. ``py.test`` is the
+#: legacy entry point and ``pytest.exe`` the Windows one; both are already in
+#: ``_RUNNER_BASES`` -- this file treats them as runners everywhere the argv is read --
+#: but no rule above spells either, because the dot defeats the token boundary the rule
+#: anchors on. They are admitted on the argv side with the versioned alias because they
+#: need the same two things and for the same reason: the dot makes each a plausible
+#: FILENAME (``py.test.log``, ``pytest.exe.bak``), so only position separates an
+#: invocation from data.
+#:
+#: ``vitest.cmd`` is in ``_RUNNER_BASES`` and is deliberately NOT admitted here. Its
+#: rule above spells an uncapped run as ``vitest run`` with nothing following it, not as
+#: a missing ``-n``, so routing it through ``_argv_declares_a_worker_cap`` -- which reads
+#: pytest's cap grammar -- would report a bounded vitest run as unbounded.
+_ARGV_ONLY_RUNNER_BASES = frozenset({"py.test", "py.test.exe", "pytest.exe"})
+
+
+#: Shapes a launcher consumes as part of its OWN grammar, so that a token carrying one
+#: is not the command's subject. Three qualify: an option, a bare number (an option's
+#: value, as in ``timeout 900`` and ``nice -n 10``), and a ``KEY=value`` assignment,
+#: which is ``env``'s whole operand grammar.
+_ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
 #: Options that consume the FOLLOWING token as their value, so that token must not
@@ -738,15 +754,22 @@ def _redacted_command(cmd: str, span: tuple[int, int]) -> str:
         name = bare.split("=", 1)[0]
         if len(kept) >= _MAX_CMD_TOKENS:
             withheld += 1
-        elif canonical in _RUNNER_BASES or (
-            index == 0 and (canonical in _LAUNCHER_BASES or _PYTHON_BASE_RE.match(canonical))
+        elif (
+            _is_runner_base(canonical)
+            or canonical in _ARGV_ONLY_RUNNER_BASES
+            or (index == 0 and (canonical in _LAUNCHER_BASES or _PYTHON_BASE_RE.match(canonical)))
         ):
             # The CANONICAL form, not the token as read. What this branch establishes
-            # is that the token equals an entry of ``_RUNNER_BASES``, ``_LAUNCHER_BASES``
-            # or the ``_PYTHON_BASE_RE`` family, case-insensitively -- so the entry is
-            # what it has licence to print. Echoing the token instead would put its
-            # casing on the line, and casing is the one caller-chosen thing left in a
-            # word already known to be one of those.
+            # is that the token is one this file calls a runner -- an entry of
+            # ``_RUNNER_BASES``, an ``_ARGV_ONLY_RUNNER_BASES`` spelling, or the
+            # versioned alias ``_ALIAS_RUNNER_BASE_RE`` admits -- or an entry of
+            # ``_LAUNCHER_BASES`` or the ``_PYTHON_BASE_RE`` family, case-insensitively.
+            # The alias belongs here for the same reason the rest do: the row this file
+            # emits for it names no joined-line rule, so the program name is the only
+            # thing that separates a real uncapped run from a command that merely names
+            # one. Echoing the token instead would put its casing on the line, and
+            # casing is the one caller-chosen thing left in a word already known to be
+            # one of those.
             keep(canonical)
         elif name in _SAFE_LONG_FLAG_NAMES or _SAFE_SHORT_FLAG_RE.match(name):
             keep(name)
@@ -1520,16 +1543,36 @@ _BUILTIN_SHAPES = frozenset(DEFAULT_BANNED_RES) | {ARGV_RUNNER_RULE_LABEL}
 def _argv_only_runner_index(argv: list[str]) -> int | None:
     """Where a runner spelling the joined-line rule cannot express stands, or None.
 
-    Two spellings qualify -- a versioned alias and ``py.test`` -- and they share the
-    property that makes this an argv question: each one is also a well-formed path
-    component or filename, so nothing but its position separates the invocation from
-    the data.
+    Two categories qualify -- a versioned alias (``pytest-3``, ``pytest-3.12``,
+    ``py.test-3``, ``pytest-3.exe``) and the dotted plain spellings ``py.test``,
+    ``py.test.exe`` and ``pytest.exe`` -- and every one shares the property that makes
+    this an argv question: each is also a well-formed path component or filename, so
+    nothing but its position separates the invocation from the data.
     """
     for index, token in enumerate(argv):
         base = _token_base(token)
         if base in _ARGV_ONLY_RUNNER_BASES or _ALIAS_RUNNER_BASE_RE.match(base):
             return index
     return None
+
+
+def _is_launcher_own_operand(token: str) -> bool:
+    """Is *token* part of the LAUNCHER's own grammar rather than the command's subject?
+
+    Three shapes are: an option, a bare number (an option's value, as in ``timeout 900``
+    and ``nice -n 10``), and a ``KEY=value`` assignment, which is ``env``'s whole operand
+    grammar. Anything else is a word the launcher will run or hand on -- a subcommand
+    (``npm run``, ``poetry run``, ``make clean``) or a script (``coverage run worker.py``)
+    -- so the command already has a subject and a runner spelling after it is that
+    subject's argument.
+
+    Naming what MAY be skipped is the point, not an accident of ordering. A deny-list of
+    suspicious shapes has to enumerate every way a program can be spelled and silently
+    accepts the ordinary word it missed; this declines an operand it does not recognise.
+    The cost is a missed alias run behind a launcher whose grammar is not described here,
+    which is the same direction this file already takes for a launcher nobody listed.
+    """
+    return token.startswith("-") or token.isdigit() or _ENV_ASSIGNMENT_RE.match(token) is not None
 
 
 def _stands_in_program_position(argv: list[str], index: int) -> bool:
@@ -1542,10 +1585,25 @@ def _stands_in_program_position(argv: list[str], index: int) -> bool:
 
     The token qualifies at index 0, or when the command opens with a launcher this
     script recognises: a launcher's job is to run something else, so a runner after one
-    is still the program. Between the launcher and the runner, an option and a bare
-    operand are allowed (``nice -n 10 pytest-3``, ``timeout 900 pytest-3``), because a
-    launcher's own options are not the runner's -- ``_argv_declares_a_worker_cap``
-    already starts its scan after the runner's token for that same reason.
+    is still the program -- but only until the launcher's own subject appears.
+
+    An INTERPRETER is the sharp case. ``python`` runs a module or a script, and only the
+    module spelling names the runner as the program: an interpreter's first non-option
+    operand IS the script, and every token after it belongs to that script. So under a
+    ``python`` family launcher the runner qualifies only as the argument of ``-m``.
+    ``python3 worker.py pytest-3`` passes an alias-shaped ARGUMENT to a script, and
+    ``python3 cleanup.py /var/tmp/pytest-of-ci/pytest-3`` passes a pytest temp path,
+    whose last component is alias-shaped for the same reason every pytest temp path is.
+
+    Behind any other recognised launcher, only the launcher's OWN grammar may stand in
+    between -- see ``_is_launcher_own_operand``. ``timeout 900 pytest-3`` and
+    ``nice -n 10 pytest-3`` qualify because a number is an option's value; ``npm run
+    build pytest-3``, ``coverage run worker.py pytest-3`` and ``make clean pytest-3`` do
+    not, because a bare word is the subject the launcher will run and a runner spelling
+    after a subject is that subject's argument. Most of ``_LAUNCHER_BASES`` takes a bare
+    subcommand or script this way, so the list says what MAY be skipped rather than what
+    disqualifies: an allow-list declines an operand it does not recognise, while a
+    deny-list of suspicious shapes accepts every ordinary word it forgot to name.
 
     An UNRECOGNISED first token disqualifies, and that is the direction to fail in
     here. ``ls /var/tmp/pytest-of-ci/pytest-3`` and ``pip install pytest-3`` are the
@@ -1554,7 +1612,7 @@ def _stands_in_program_position(argv: list[str], index: int) -> bool:
     to guess. The cost of declining is a missed alias run behind a launcher nobody
     listed, which is exactly today's behaviour and loses nothing that exists now.
 
-    A recognised launcher whose OPERAND happens to be alias-shaped -- ``make pytest-3``
+    A recognised launcher whose IMMEDIATE operand is the alias -- ``make pytest-3``
     naming a make target -- does qualify. That target overwhelmingly runs the runner,
     and over-reporting a pid an operator can dismiss is the direction this file already
     chose over hiding an unbounded run for a whole session.
@@ -1562,17 +1620,11 @@ def _stands_in_program_position(argv: list[str], index: int) -> bool:
     if index == 0:
         return True
     first = _token_base(argv[0])
-    if first not in _LAUNCHER_BASES and not _PYTHON_BASE_RE.match(first):
+    if _PYTHON_BASE_RE.match(first):
+        return argv[index - 1] == "-m"
+    if first not in _LAUNCHER_BASES:
         return False
-    # Everything between the launcher and the runner must look like the launcher's own
-    # option or operand, never a target: a path-shaped token there means the command
-    # already had a subject before the alias, so the alias is not the program.
-    for token in argv[1:index]:
-        if token.startswith("-"):
-            continue
-        if "/" in token or "\\" in token:
-            return False
-    return True
+    return all(_is_launcher_own_operand(token) for token in argv[1:index])
 
 
 def _argv_is_uncapped_argv_only_runner(argv: list[str]) -> bool:
@@ -1818,6 +1870,12 @@ def _host_lines(cfg: dict[str, Any]) -> tuple[list[str], str]:
     banned_res = [
         re.compile(rx) for rx in cfg.get("banned_process_res") or list(DEFAULT_BANNED_RES)
     ]
+    # The argv-side shape is switched off by ONE named key and by nothing else. An
+    # operator who wants it gone says so about this shape; supplying, replacing or
+    # emptying ``banned_process_res`` does not touch it, because a protection that
+    # disappears as a side effect of an edit aimed at something else is removed by
+    # someone who never decided to remove it.
+    argv_shape_enabled = cfg.get("argv_runner_detection", True) is not False
     fleet = [p for p in cfg.get("fleet_worktrees") or []]
     lines: list[str] = []
     # /proc, with an env seam for the test harness only -- not a config key,
@@ -1872,6 +1930,17 @@ def _host_lines(cfg: dict[str, Any]) -> tuple[list[str], str]:
                     # unless the token's POSITION is read. Asked here, of the argv,
                     # AFTER every rule has declined -- so this path can only ADD a
                     # line, never change the rule a matching pid reports.
+                    #
+                    # It is asked whatever the rule list holds, because rule ORIGIN is
+                    # what carries built-in authority in this file -- the same basis
+                    # ``_is_shell_command_wrapper``'s exemption is written against. A
+                    # gate on ``banned_process_res`` merely being SET would let a
+                    # config edit switch a built-in protection off, which is a worse
+                    # property than the extra line it would suppress. An operator who
+                    # wants this shape gone says so with ``argv_runner_detection``,
+                    # which names the shape it disables.
+                    if not argv_shape_enabled:
+                        continue
                     if not _argv_is_uncapped_argv_only_runner(argv):
                         continue
                     matched = ARGV_RUNNER_RULE_LABEL
@@ -2288,6 +2357,14 @@ def _config_error(cfg: dict[str, Any]) -> str | None:
     for item in cfg.get("sessions") or []:
         if not _KEY_RE.fullmatch(item):
             return f"session key {item!r} is not a plain key (keys are stems, never paths)"
+    # The opt-out must be a real boolean. A string, a number or null here would be
+    # read as "not False" and silently leave the shape ON, so an operator who meant
+    # to disable it keeps a protection they decided to remove -- and would find out
+    # only from a line they thought they had switched off. The other direction is
+    # worse still: a value read as falsey would disable a protection nobody named.
+    argv_detection = cfg.get("argv_runner_detection")
+    if argv_detection is not None and not isinstance(argv_detection, bool):
+        return "argv_runner_detection must be true or false"
     # A relative worktree root would be compared against an absolute
     # /proc/<pid>/cwd target and could never match, so every banned run inside
     # the fleet would be filed as foreign and go unreported. Say so at load time
