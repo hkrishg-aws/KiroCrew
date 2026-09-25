@@ -29,9 +29,11 @@ another.
 from __future__ import annotations
 
 import ast
+import contextlib
 import importlib
 import inspect
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
 
@@ -53,6 +55,41 @@ OWNER_MODULES: tuple[str, ...] = tuple(sorted(set(facade._EXPORTS.values())))
 
 def _owner(name: str) -> ModuleType:
     return importlib.import_module(f"{PACKAGE}.{facade._EXPORTS[name]}")
+
+
+@contextlib.contextmanager
+def _owner_restored(module_name: str) -> Iterator[None]:
+    """Put back BOTH places a purged-and-reimported owner leaves changed.
+
+    A test that purges an owner and lets it be imported again has changed two
+    things, not one. The obvious one is :data:`sys.modules`. The other is this
+    package's own attribute: ``importlib`` finishes a submodule import by setting
+    it on the parent package, so ``kiro_crew.security.paths`` is rebound to the
+    fresh copy -- and that name is an ``_EXPORTS`` VALUE, not a key, so the write
+    lands on the package itself rather than being forwarded.
+
+    Restoring only ``sys.modules`` therefore leaves the package pointing at a
+    module no reader runs, and every later ``monkeypatch.setattr(security.paths,
+    ...)`` in the worker patches that dead copy. Both are captured here and put
+    back together.
+    """
+    leaf = module_name.rsplit(".", 1)[1]
+    had_module = module_name in sys.modules
+    module = sys.modules.get(module_name)
+    had_attribute = hasattr(facade, leaf)
+    attribute = getattr(facade, leaf, None)
+    try:
+        yield
+    finally:
+        if had_module:
+            sys.modules[module_name] = module  # type: ignore[assignment]
+        else:
+            sys.modules.pop(module_name, None)
+        if had_attribute:
+            setattr(facade, leaf, attribute)
+        else:
+            with contextlib.suppress(AttributeError):
+                delattr(facade, leaf)
 
 
 def _source() -> str:
@@ -196,6 +233,7 @@ class TestOneStorageForTheOwner:
         source = _source()
         for fragment in (
             "def _owner(name: str) -> ModuleType:",
+            "return sys.modules[module_name]",
             "return importlib.import_module(module_name)",
             "class _ReExportModule(ModuleType):",
             "def __setattr__(self, name: str, value: Any) -> None:",
@@ -203,6 +241,32 @@ class TestOneStorageForTheOwner:
             "sys.modules[__name__].__class__ = _ReExportModule",
         ):
             assert fragment in source, f"the facade is missing {fragment!r}"
+
+    def test_a_resolved_owner_is_read_without_calling_import_module(self) -> None:
+        """The store answers; the import only fills it.
+
+        ``importlib.import_module`` is an attribute of a module any caller can
+        rebind, and tests do -- ``patch("importlib.import_module")`` appears three
+        times in this repository for unrelated reasons. If a resolved owner were
+        fetched by calling it, every read of every gate here would be answered by
+        whatever that patch returns for as long as it is installed, which for a
+        security predicate is a value chosen by unrelated code.
+
+        Asserted by behaviour, not by reading the source: with the import refused
+        outright, a name whose owner is already in ``sys.modules`` still reads.
+        """
+        name = "is_sensitive_path"
+        expected = getattr(_owner(name), name)
+        real = importlib.import_module
+
+        def _refuse(target: str, package: str | None = None) -> ModuleType:
+            raise AssertionError(f"resolution called import_module for {target!r}")
+
+        importlib.import_module = _refuse  # type: ignore[assignment]
+        try:
+            assert getattr(facade, name) is expected
+        finally:
+            importlib.import_module = real  # type: ignore[assignment]
 
     def test_the_facade_keeps_no_resolved_owner_mapping(self) -> None:
         """A mapping of resolved owner MODULES is the second storage this removes."""
@@ -212,7 +276,6 @@ class TestOneStorageForTheOwner:
             "_OWNERS: dict",
             "_OWNERS.get(",
             "_OWNERS[",
-            "sys.modules.get(module_name)",
             "globals()[name]",
         ):
             assert forbidden not in source, (
@@ -246,9 +309,9 @@ class TestOneStorageForTheOwner:
         """The genuine purge, not a stand-in: a fresh module object, freshly built."""
         name = "is_sensitive_path"
         module_name = f"{PACKAGE}.{facade._EXPORTS[name]}"
-        stale = sys.modules[module_name]
-        del sys.modules[module_name]
-        try:
+        with _owner_restored(module_name):
+            stale = sys.modules[module_name]
+            del sys.modules[module_name]
             fresh = importlib.import_module(module_name)
             assert fresh is not stale
             assert getattr(facade, name) is getattr(fresh, name)
@@ -265,16 +328,14 @@ class TestOneStorageForTheOwner:
             finally:
                 setattr(facade, name, original)
             assert getattr(fresh, name) is original
-        finally:
-            sys.modules[module_name] = stale
 
     def test_a_purged_owner_is_seen_by_a_write_too(self) -> None:
         """A write must not land on a module ``sys.modules`` has replaced."""
         name = "DENIED_ROOT_PARTS"
         module_name = f"{PACKAGE}.{facade._EXPORTS[name]}"
-        stale = sys.modules[module_name]
-        del sys.modules[module_name]
-        try:
+        with _owner_restored(module_name):
+            stale = sys.modules[module_name]
+            del sys.modules[module_name]
             fresh = importlib.import_module(module_name)
             stale_before = getattr(stale, name)
             original = getattr(fresh, name)
@@ -285,8 +346,20 @@ class TestOneStorageForTheOwner:
                 assert getattr(stale, name) is stale_before
             finally:
                 setattr(facade, name, original)
-        finally:
-            sys.modules[module_name] = stale
+
+    def test_a_purge_leaves_this_package_pointing_at_the_live_module(self) -> None:
+        """The leak the restore above exists to stop, asserted directly.
+
+        A submodule import ends by setting the submodule on its parent package, so
+        a purge-and-reimport rebinds ``security.<leaf>``. If a test restored only
+        :data:`sys.modules`, this package would keep the dead copy and every later
+        patch through ``security.<leaf>`` would miss every reader.
+        """
+        module_name = f"{PACKAGE}.paths"
+        with _owner_restored(module_name):
+            del sys.modules[module_name]
+            importlib.import_module(module_name)
+        assert facade.paths is sys.modules[module_name]
 
 
 class TestTheFacadesOwnCodeReadsTheOwner:
@@ -373,26 +446,40 @@ class TestAnUnresolvableGateFailsClosed:
     def test_the_gate_is_in_the_table(self, name: str) -> None:
         assert name in facade._EXPORTS
 
-    @pytest.mark.parametrize("name", GATES)
-    def test_an_unimportable_owner_raises_rather_than_answering(
-        self, name: str, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        module_name = f"{PACKAGE}.{facade._EXPORTS[name]}"
+    @staticmethod
+    @contextlib.contextmanager
+    def _owner_will_not_resolve(module_name: str) -> Iterator[None]:
+        """Make one owner genuinely unresolvable, both halves of resolution.
+
+        The resolver reads :data:`sys.modules` and imports only on a miss, so an
+        owner that cannot be obtained is absent from the store AND refuses to
+        import -- which is also the real shape of the condition: a module that
+        fails to import never reaches ``sys.modules``. Refusing the import alone
+        would leave the store answering and prove nothing.
+        """
         real = importlib.import_module
 
-        def _refuse(target: str, *args: object, **kwargs: object) -> ModuleType:
+        def _refuse(target: str, package: str | None = None) -> ModuleType:
             if target == module_name:
                 raise ImportError(f"refused for the test: {target}")
-            return real(target, *args, **kwargs)
+            return real(target, package)
 
-        monkeypatch.setattr(importlib, "import_module", _refuse)
-        with pytest.raises(ImportError):
+        with _owner_restored(module_name):
+            del sys.modules[module_name]
+            importlib.import_module = _refuse  # type: ignore[assignment]
+            try:
+                yield
+            finally:
+                importlib.import_module = real  # type: ignore[assignment]
+
+    @pytest.mark.parametrize("name", GATES)
+    def test_an_unimportable_owner_raises_rather_than_answering(self, name: str) -> None:
+        module_name = f"{PACKAGE}.{facade._EXPORTS[name]}"
+        with self._owner_will_not_resolve(module_name), pytest.raises(ImportError):
             getattr(facade, name)
 
     @pytest.mark.parametrize("name", GATES)
-    def test_a_defaulted_getattr_cannot_manufacture_a_falsy_gate(
-        self, name: str, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_a_defaulted_getattr_cannot_manufacture_a_falsy_gate(self, name: str) -> None:
         """``getattr(facade, gate, None)`` must not hand back ``None``.
 
         This is the fail-open shape: the default swallows ``AttributeError``, so a
@@ -400,15 +487,7 @@ class TestAnUnresolvableGateFailsClosed:
         and a caller testing it for truth would read "not sensitive".
         """
         module_name = f"{PACKAGE}.{facade._EXPORTS[name]}"
-        real = importlib.import_module
-
-        def _refuse(target: str, *args: object, **kwargs: object) -> ModuleType:
-            if target == module_name:
-                raise ImportError(f"refused for the test: {target}")
-            return real(target, *args, **kwargs)
-
-        monkeypatch.setattr(importlib, "import_module", _refuse)
-        with pytest.raises(ImportError):
+        with self._owner_will_not_resolve(module_name), pytest.raises(ImportError):
             getattr(facade, name, None)
 
     def test_a_name_that_does_not_exist_still_raises_attribute_error(self) -> None:
@@ -476,3 +555,56 @@ class TestAnUnresolvableGateFailsClosed:
             "the no-security fallback no longer answers True for every path, so an "
             f"unresolvable gate would stop denying: {returns}"
         )
+
+
+class TestTheStarImportSurface:
+    """``import *`` consults ``__all__`` and never reaches ``__getattr__``.
+
+    That is the one read path resolution cannot serve on its own: the star form is
+    resolved by the import machinery against a declared list, so a package that
+    binds nothing and declares nothing carries only what it happens to hold -- and
+    a caller's first use of a re-exported predicate is a ``NameError``. The list
+    is therefore derived from the table, which is what keeps it from becoming a
+    second place a name has to be written down.
+    """
+
+    @staticmethod
+    def _star_imported() -> set[str]:
+        namespace: dict[str, object] = {}
+        exec(f"from {PACKAGE} import *", namespace)  # noqa: S102 — the subject
+        return {name for name in namespace if not name.startswith("__")}
+
+    def test_every_public_table_name_arrives(self) -> None:
+        public = {name for name in facade._EXPORTS if not name.startswith("_")}
+        missing = sorted(public - self._star_imported())
+        assert not missing, (
+            f"{len(missing)} re-exported name(s) do not survive a star import, so a "
+            f"star importer gets a NameError at first use: {missing[:8]}"
+        )
+
+    def test_a_private_table_name_does_not_arrive(self) -> None:
+        """A private name is re-exported for a direct read, never by ``import *``."""
+        arrived = sorted(name for name in self._star_imported() if name.startswith("_"))
+        assert not arrived, f"a star import carried private name(s): {arrived[:8]}"
+
+    def test_the_list_is_derived_from_the_table(self) -> None:
+        """A written-out list would be a second place every name has to appear."""
+        tree = ast.parse(_source())
+        assignments = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "__all__" for target in node.targets
+            )
+        ]
+        assert len(assignments) == 1, "the facade declares no single __all__"
+        value = assignments[0].value
+        assert not isinstance(value, (ast.List, ast.Tuple, ast.Set)), (
+            "__all__ is written out as a literal, which is a second place every "
+            "exported name has to be kept in step with _EXPORTS"
+        )
+        read_names = {node.id for node in ast.walk(value) if isinstance(node, ast.Name)}
+        assert (
+            "_EXPORTS" in read_names
+        ), f"__all__ is not derived from the export table: it reads {sorted(read_names)}"

@@ -30,7 +30,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 from urllib.parse import parse_qs, unquote, unquote_plus, urlparse
 
 from kiro_crew.credential_patterns import AWS_KEY_ID, JWT_MULTI_SEGMENT
@@ -79,6 +79,7 @@ from . import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator
+    from typing import Any
 
     from kiro_crew.vector_memory import VectorMemoryStore
 
@@ -2950,30 +2951,35 @@ _EXPORTS: dict[str, str] = {
 
 
 def _submodule(module: str) -> ModuleType:
-    """Return a submodule of this package, resolved through the import system.
+    """Return a submodule of this package, read from where modules are stored.
 
-    The read path this module's OWN code uses. A function defined here resolves a
-    bare global through this module's namespace directly, which ``__getattr__``
-    never sees, so it cannot read a re-exported name the way an outside caller
-    does. It asks for the owner instead and reads the name off it, which lands on
-    the same single storage location every other reader uses.
+    The single resolution site, used by the re-export protocol and by this
+    module's OWN code: a function defined here resolves a bare global through this
+    module's namespace directly, which ``__getattr__`` never sees, so it asks for
+    the owner and reads the name off it instead.
+
+    :data:`sys.modules` IS the one place a module is stored, so the read goes
+    there and a purged or replaced owner is seen at once. ``import_module`` is
+    what POPULATES that store, so it answers only the miss -- and keeping it off
+    the resolved path matters beyond speed: it is an attribute of a module any
+    caller can rebind, and a test that patches it for its own reasons
+    (``patch("importlib.import_module")``, three sites in this repository) would
+    otherwise reroute every read of every security gate here to that patch for as
+    long as it is installed.
+
+    A mapping of resolved owners kept in this module would be the second storage
+    location this package exists to remove.
     """
-    return importlib.import_module(f"{__name__}.{module}")
+    module_name = f"{__name__}.{module}"
+    try:
+        return sys.modules[module_name]
+    except KeyError:
+        return importlib.import_module(module_name)
 
 
 def _owner(name: str) -> ModuleType:
-    """Return the submodule that defines ``name``, importing it on first use.
-
-    ``importlib.import_module`` is the resolution rather than a mapping kept here.
-    It answers from :data:`sys.modules`, the one place a module is stored, so a
-    purged or replaced owner is seen at once; and it waits on that module's import
-    lock while its body is still running. A private mapping of resolved owners
-    would be a second storage location, and a bare ``sys.modules`` read would hand
-    a partially initialised module to a thread that asks for a name while another
-    thread is still importing its owner.
-    """
-    module_name = f"{__name__}.{_EXPORTS[name]}"
-    return importlib.import_module(module_name)
+    """Return the submodule that defines ``name``, resolved on each access."""
+    return _submodule(_EXPORTS[name])
 
 
 def __getattr__(name: str) -> Any:
@@ -3034,6 +3040,15 @@ class _ReExportModule(ModuleType):
 # Installed last, so the forwarding is live for every caller but never runs while
 # this module is still binding its own names.
 sys.modules[__name__].__class__ = _ReExportModule
+
+# ``from kiro_crew.security import *`` consults this list and never reaches
+# ``__getattr__``, so without it a star import would carry only the names this
+# module binds itself and every re-exported predicate would be missing -- a
+# ``NameError`` at the star-importer's first use. It is DERIVED from the two
+# authorities rather than written out, so it is a projection of them and not a
+# third list of names to keep in step: the table's keys, plus what this module
+# binds, minus the private names a star import never carried.
+__all__ = sorted(name for name in set(globals()) | set(_EXPORTS) if not name.startswith("_"))
 
 
 if TYPE_CHECKING:  # keep the names visible to type checkers and IDEs
