@@ -153,8 +153,92 @@ deliberate v1 simplification we may revisit.
 | `session.pool_size` | `0` | Warm-pool size; reserved in the memory term when > 0 |
 
 The cap interacts with `spawn_min_memory_gb` but does not replace it: the cap is
-a startup count limit, while `spawn_min_memory_gb` is a real-time per-spawn
-memory floor. They are independent guards.
+a bound on the RUNNING population, while `spawn_min_memory_gb` is a real-time
+per-spawn memory floor. They are independent guards.
+
+Three things bound a fan-out, and they bound different quantities. The cap
+bounds how many agents RUN at once. `subagent_spawn_stagger_secs` bounds the
+RATE at which starts are admitted -- one per interval -- and says nothing about
+how many are still starting. `SubagentManager._startup_cap` bounds how many
+admitted agents are IN STARTUP at once: executing (`_exec_started` set) or
+parked at the spawn-approval prompt (`_awaiting_approval`), with no runtime
+PID, no first provider stream and no turn. The parked arm is there because
+admission is the only place the bound is checked and everything past it
+reaches the session-start gate with no further check: a parked agent goes
+straight from approval to `_run`, and a bulk trust / yolo grant resolves every
+pending prompt in one pass, so it has to be counted while it is parked. A
+durable-store reservation not yet registered as an agent is counted in its
+place for the same reason. The startup watchdog reaps only the executing arm
+(`_is_startup_stalled` keys on `_exec_started`): a human prompt has no
+deadline. Without the third bound, one start is admitted
+every interval however long each start takes; when each start is slow (a
+dedicated process per `model` / `reasoning_effort` override, a queue at the
+session-start gate, a throttled provider handshake) dozens sit in startup
+together, all contending for the same gate and all running down the same
+startup deadline. Measured on a 623-item fan-out (2026-09): waves of 24-45
+items lost ~2%, waves of 50-60 lost 2-16%, and a wave of 120 lost ~50% -- every
+loss a healthy start reaped as `Failed to start within 120s`, and every retry of
+one deepening the crowd that caused it. The bound holds further spawns in the
+EXISTING queue (`_should_stagger_queue_impl` gains a third clause; the drain
+pump holds its pick under the same test) and the queue wakes on the edges that
+free a startup slot: a runtime PID or a first stream (`_note_startup_progress`)
+and a terminal, including the watchdog's reap of a wedged start (the
+slot-release drain), so a wedged population cannot hold the queue past the
+reap.
+
+The bound is tied to the session-start gate, not to the running cap:
+`2 × session_start_concurrency` (`_STARTUP_CAP_GATE_ROUNDS` rounds of the
+gate's width), clamped to `[1, cap]`, because the gate is what produces the
+reap the bound exists to prevent. The start clock resets only once a permit is HELD (next paragraph), so
+a start whose PRE-PERMIT wait alone outlives the watchdog deadline is reaped on
+its original clock, healthy or not. With `G` permits and at most `2G` agents in
+startup, `G` hold permits and at most `G` wait, so the last waiter's pre-permit
+wait is ONE round of the current holders' `session/new` calls -- and one round
+is itself bounded by the same deadline, because a holder that has not
+progressed within it of gate exit is reaped and releases its permit. A healthy
+start's pre-permit wait therefore cannot exceed the deadline unless a holder's
+own start already did. A cap-derived term -- an earlier revision used
+`max(2 × G, ceil(cap / 4))` -- broke exactly this: at a cap of 64 it admitted
+16 into startup against a 2-permit gate, seven rounds of pre-permit wait, which
+can outlive the deadline while every start is healthy. Fewer than `2G` would
+idle the gate between rounds (no next round already admitted when the current
+one releases), so `2G` is the smallest bound that keeps the gate saturated and
+the largest that keeps the pre-permit wait to one round. At the default gate
+width of 2 the bound is `4` at any cap of 4 or more (cap 8, 40 and 64 alike),
+`cap` below that, and `1` at a cap of `0` (the running cap, not this bound,
+pauses admission there). Admission throughput is unchanged by the bound: the
+gate serves `G` starts per round regardless of how many are queued behind it,
+so queueing more than one round buys no starts, only pre-permit wait.
+
+There is no config key for this bound, on purpose. `2G` is both the floor and
+the ceiling of the useful range -- below it the gate idles, above it only
+pre-permit wait accrues -- so a knob could only move the value somewhere worse,
+and the operator's real lever already exists: `agent.session_start_concurrency`
+sizes the gate, and the bound tracks it. An earlier revision shipped
+`agent.subagent_max_concurrent_startups` as an override and it was removed for
+this reason.
+
+Time spent WAITING FOR A PERMIT is charged as startup time only until the permit
+is granted, on either start path. `runtime.create_session` runs under the ACP
+`SessionStartGate` (`agent.session_start_concurrency`, default 2) and reports
+the queue wait at gate exit; `_gate_exit_reset` resets the run's start clock
+there, so from that point the watchdog measures time spent STARTING with a
+permit held, not time queued behind other starts. The reset fires only after
+permit acquisition: a start whose gate wait alone outlives the watchdog
+deadline is reaped before the reset ever runs, on its original clock. The
+session-shared path always did this; the dedicated-process path (`model` /
+`reasoning_effort` spawns, through `get_or_create` -> provider factory ->
+`AcpProvider`) now does too.
+
+The startup watchdog's deadline itself stays fixed (`120s`,
+`SubagentManager(startup_timeout=...)`) however many agents are in startup. A
+deadline that grew with the in-startup population was tried on this branch and
+withdrawn: the measurement that motivated the work predates the gate-exit reset
+and the in-startup bound, so nothing showed a healthy start still missing the
+base deadline once queue time stopped being charged, and the term as written
+was not monotonic -- sampled at sweep time against a clock spanning the whole
+crowded period, it shrank as the crowd drained and could reap an agent that an
+earlier sweep had left inside its window.
 When the memory floor is enabled, admission also reserves memory for the next
 start, for claimed starts awaiting registration, and for live dedicated workers.
 A start that has not settled yet -- fewer than two reaper sweeps have measured

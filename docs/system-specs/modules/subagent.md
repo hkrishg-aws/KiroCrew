@@ -324,6 +324,55 @@ invariants:
   wait ended) is granted before the stagger check and does not bump
   `_last_spawn_ts`: the run is already resident, so there is no process burst
   to smooth, and an in-place recovery no longer pays the stagger interval.
+- **The in-startup population is bounded separately from both the cap and the
+  stagger.** The cap bounds how many RUN, the stagger bounds the RATE of
+  starts, and neither bounds how many admitted agents are still STARTING:
+  one start was admitted per interval however long each took, so under slow
+  starts (a dedicated process per `model` / `reasoning_effort` override, a
+  queue at the `SessionStartGate`, a throttled handshake) a wide fan-out piled
+  dozens of agents into startup at once and the fixed 120s startup watchdog
+  reaped healthy ones as `Failed to start within 120s` (measured ~50% loss on a
+  120-item wave against ~2% at 24-45). `_should_stagger_queue_impl` therefore
+  has a third clause: `_startup_population() >= _startup_cap()` queues the
+  spawn like a full cap does, and `_drain_queue_sync_impl` holds its pick under
+  the same test (after the resume grants -- a resume is not a start). The
+  population is `_in_startup`: `turns == 0`, no `_pid`, no
+  `_first_stream_started`, not done or reaping, and EITHER executing
+  (`_exec_started` set) OR parked at the spawn-approval prompt
+  (`_awaiting_approval`, `_exec_started` still `None`); plus
+  `_startup_reservations` (a `ClaimPoint` reserved but not yet re-entered and
+  registered). Admission is the only place the bound is checked; an approval-parked agent goes from
+  `_spawn_with_approval` straight to `_run`, and `tool_approval:bulk_trust` /
+  `bulk_yolo` resolves every pending prompt in one pass, so a bound that
+  excluded parked agents admitted a whole wave to park and released it into
+  startup at once (pinned by
+  `test_bulk_approval_cannot_release_more_than_the_startup_cap`, which drives
+  `spawn()` through the real `_spawn_with_approval`). The watchdog
+  (`_is_startup_stalled`) keys on `_exec_started` and stays blind to a parked
+  agent: a human prompt has no deadline. The bound is `_startup_cap()` =
+  `2 × session_start_concurrency` (`_STARTUP_CAP_GATE_ROUNDS` rounds of the
+  gate's width) clamped to `[1, _max_concurrent]` -- so `1`, not `0`, at a cap
+  of `0`. It is tied to the GATE and not to the cap because the
+  gate is what produces the reap: `_gate_exit_reset` restarts the start clock
+  only once a permit is held, so a start whose pre-permit wait alone outlives
+  `_startup_deadline` is reaped on its original clock. With `G` permits and at
+  most `2G` in startup the last waiter's pre-permit wait is one round of the
+  current holders, and a holder that has not progressed within the deadline of
+  gate exit is itself reaped and releases its permit, so one round is bounded
+  by the deadline too -- a healthy start cannot be reaped pre-permit unless a
+  holder's own start already was. An earlier cap-derived term (`ceil(cap / 4)`)
+  admitted 16 into startup at cap 64 against a 2-permit gate, seven rounds of
+  pre-permit wait, and was dropped for that reason. There is deliberately no
+  config key: `2G` is both floor and ceiling of the useful range (below idles
+  the gate, above adds only pre-permit wait), so an override could only make
+  it worse, and `agent.session_start_concurrency` is already the operator's
+  lever -- the bound tracks it. The earlier `agent.subagent_max_concurrent_startups`
+  override was removed on those grounds. No second queue and no timer: a held
+  drain arms nothing, because every edge that frees a startup slot already pumps --
+  `_note_startup_progress` from `_run_inner` at the PID record and the first
+  stream, and the slot-release drain on every terminal, including the
+  watchdog's reap of a wedged start, so a wedged population cannot hold the
+  queue past its reap. Pinned by `test_subagent_startup_pressure.py`.
 - **Lowering the cap cancels nothing.** In-flight runs keep going; the gate
   simply admits no new spawn until `_running_count` drains below the new cap on
   its own.
@@ -875,6 +924,7 @@ An unmarked `CancelledError` (see intentional-cancel rule) triggers `_schedule_c
 - **taskq pump** (`OrphanStallMonitor.taskq_pump`, facade `_taskq_pump`): `start_reaper` runs it once after `taskq_boot_dispatch` (building the manager's `DependencyCoordinator` from `agent.dependency_*` over the admission store, `capacity = _max_concurrent`, and running `coordinator.rebuild()` after `open_default_store` ran `WaitLedger.rebuild()`), every sweep re-runs it as the backstop, and every run that parks on a wait calls it. One pass = `admission.taskq_expire_waits()` (wait deadlines) + `coordinator.tick()` (due scopes) + a one-shot `loop.call_later` re-armed at `coordinator.next_deadline()`, so a scope is woken when it is due, not on the next 60s sweep. The coordinator is registered process-wide (`taskq.dependency.register_coordinator`) for the main chat's read of scope schedules. Terminal runs call `coordinator.forget(id)` from `_run`'s finally (a finished probe is the scope's recovery signal) and withdraw any pending resume entry.
 - `_force_reap`: reset with 30s timeout → SIGKILL fallback → mark done → fire `subagent_done` WS event
 - **Startup-stall admission ends when the first provider stream begins.** A provider may create its child process lazily from `stream()`, so a missing PID before the first response is not proof that execution never started. The marker resets for every recovery execution; the startup watchdog may reap only a subagent with no first stream, no runtime PID, and no completed turn. The ordinary wall-clock deadline remains unchanged.
+- **The startup deadline is fixed; the clock starts at gate exit.** `_is_startup_stalled` compares `now - _exec_started` against the bare `_startup_deadline` however many other agents are `_in_startup`. What changed is where the clock starts: `_gate_exit_reset` moves `_exec_started` to `SessionStartGate` exit on both start paths, so the deadline measures time spent starting with a permit held, and the in-startup population is bounded separately at admission (`_startup_cap`). A pressure-aware deadline (base plus a term per other agent in startup) was tried on this branch and withdrawn: the motivating measurement predates the gate-exit reset and the in-startup bound, so nothing showed a healthy start still missing the base deadline once queue time stopped being charged, and the term was not monotonic -- sampled at sweep time against a clock spanning the whole crowded period, it shrank as the crowd drained and could reap an agent an earlier sweep had left inside its window. The reaper's warning still names the in-startup population, as diagnostics only. Pinned by `test_subagent_startup_pressure.py` and `test_subagent_startup_watchdog.py`.
 - **Terminal completion is arbitrated by FOUR separate guards, not by `reaped` alone.** Two paths can finish a subagent — `_force_reap` and `_run`'s `finally` — and between them there are four distinct one-time concerns. Earlier revisions tried to arbitrate them with `reaped` plus `done` and every attempt satisfied two while breaking a third (duplicate delivery when the marker was set late; a lost outcome when it was set early and the reaper was cancelled; a lost outcome when the claim was handed back to a run that had already exited; and finally **no reporter at all plus a leaked concurrency slot** when the report claim was gated on `not info.done`). The guards are now:
   1. **`info.reaped` — classification.** Was this a deliberate reap? The cancel-recovery scheduler reads it, and the marker MUST precede the intentional cancel (see the intentional-cancel rule above) or an unexpected-cancel respawn fires on the run being killed. Unchanged.
   2. **`if not info.done` — the terminal RECORD.** Error synthesis, failure stat, tombstone, cost. First-arrival-wins, so it is never written twice (pinned by `test_subagent.py::TestOnDoneTimeout::test_force_reap_skips_tombstone_when_already_done`).
@@ -2057,9 +2107,29 @@ Decision + lifecycle:
   record the shared path.
 - `runtime.create_session()` runs under the ACP `SessionStartGate`
   (`agent.session_start_concurrency`, see acp-client.md). `_create_shared_session`
-  passes `on_gate_acquired`, which resets `info._exec_started` / `last_activity`
-  at gate EXIT so the 120s startup watchdog and the stall clock never count
-  queue time, and records the wait in `info._start_queue_wait_ms`.
+  passes `on_gate_acquired` = `_gate_exit_reset(info)`, which resets
+  `info._exec_started` / `last_activity` at gate EXIT so the startup watchdog
+  and the stall clock count queue time only until the permit is granted (a wait
+  that alone outlives the watchdog deadline is reaped before the reset runs),
+  and records the wait in `info._start_queue_wait_ms`.
+- **The dedicated-process path gets the SAME gate-exit reset.** Every `model` /
+  `reasoning_effort` / `allowed_tools` / `bare` spawn takes `get_or_create`, and
+  its own `AcpRuntime.create_session` runs under the same `SessionStartGate`;
+  until this reset existed, that queue time was charged to the fixed startup
+  deadline, so a wide model-pinned fan-out reaped healthy starts as `Failed to
+  start within 120s` -- the strongest single mechanism behind the measured ~50%
+  loss at 120 items. `_run_inner` passes `on_gate_acquired=_gate_exit_reset(info)`
+  into `get_or_create`; it rides `extra_factory_kwargs` to the provider factory
+  (`config/loader.py` `_acp`, where it is a NAMED parameter -- the `**_kwargs`
+  catch-all would swallow it silently), into `AcpProvider(on_gate_acquired=...)`,
+  and from `_start_kiro_runtime_impl` into the process's `create_session`. It is
+  not passed to `load_session`: a `session/load` resume takes no gate permit.
+  ONE definition (`RunEventCoordinator._gate_exit_reset_impl`) serves both
+  paths, so the clock rule cannot drift between them. The reset fires only once
+  the permit is HELD: a start wedged before the gate keeps its original clock
+  and is still caught; one wedged after it is caught at the base deadline from
+  gate exit. Pinned by `test_subagent_startup_pressure.py`
+  (`TestDedicatedPathGateExitReset`, `TestGateExitResetIsOneDefinition`).
 - **A `session/new` timeout is congestion, never a reason for a dedicated
   process.** `AcpRequestTimeout` from the shared runtime goes to
   `_await_late_start`: the row is marked `recovering`, and the run waits for
