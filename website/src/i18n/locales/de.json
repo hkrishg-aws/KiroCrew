@@ -136,7 +136,9 @@
     "parentChange_changed": "Die Vorlage hat dies geändert",
     "discardDraftTitle": "Entwurf der Fähigkeiten verwerfen?",
     "discardDraftBody": "Das Verwerfen der Fähigkeiten-Änderungen für {{name}} lässt den Editor offen. Gespeicherte Werte und verborgene Zugangsdaten bleiben unverändert. Kein anderes Mitglied ist betroffen.",
-    "discardDraftConfirm": "Entwurf verwerfen"
+    "discardDraftConfirm": "Entwurf verwerfen",
+    "driftHint": "Die Agent-Datei wurde außerhalb dieser Seite geändert. Drücke unten auf „Änderungen prüfen“, um zu sehen, was diese äußere Änderung in der Datei geändert hat. Kann diese Seite die Änderung anzeigen, schreibt Speichern die reparierte Datei und neue Chats starten wieder. Kann sie es nicht, hält Speichern an und sagt dir, was du stattdessen tun kannst.",
+    "unreviewableDrift": "Die Agent-Datei {{file}} wurde in {{keys}} geändert, einer Einstellung, die diese Seite nicht anzeigen kann, deshalb lässt sie sich von hier nicht speichern. Öffne ~/.kiro/agents/{{file}} in einem Texteditor. Ändere {{keys}} dort oder mache es rückgängig, und öffne diese Seite dann neu."
   },
   "api": {
     "client": {
@@ -9943,7 +9945,9 @@
         "sign_in_hint": "Öffne Einstellungen → Übersicht → Kiro-Anmeldung, melde dich erneut an und sende deine Nachricht noch einmal.",
         "feature_request_form": "Formular für Funktionsvorschläge öffnen",
         "feature_request_form_hint": "Dein monatliches Kontingent ist aufgebraucht — reiche deinen Vorschlag stattdessen auf GitHub über dieses Formular ein. Dieses Formular umgeht den Agenten: Es öffnet das GitHub-Issue-Formular, das du selbst ausfüllst, und verbraucht nichts von deinem monatlichen Kontingent.",
-        "session_start_repeat_hint": "Die Agent-Sitzung konnte mehrmals hintereinander nicht gestartet werden; Fortsetzen würde nur denselben Start wiederholen. Starte das Gateway in einem Terminal mit {{command}} neu und sende deine Nachricht noch einmal."
+        "session_start_repeat_hint": "Die Agent-Sitzung konnte mehrmals hintereinander nicht gestartet werden; Fortsetzen würde nur denselben Start wiederholen. Starte das Gateway in einem Terminal mit {{command}} neu und sende deine Nachricht noch einmal.",
+        "capabilities_changed": "Die Agent-Datei dieses Crew-Mitglieds wurde außerhalb der Capabilities-Seite geändert, daher können keine neuen Chats starten. Öffne Capabilities, prüfe die Änderung und speichere sie, dann starte einen neuen Chat.",
+        "open_capabilities": "Capabilities öffnen"
       },
       "folderPanel": {
         "clear_search": "Suche löschen",

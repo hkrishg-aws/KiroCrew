@@ -126,6 +126,35 @@ describe('crew capability draft editor with mocked HTTP', () => {
     expect(screen.queryByText(other)).not.toBeInTheDocument()
   })
 
+  it('lets a changed agent file be reviewed and saved with no edit first', async () => {
+    view.runtime = { ...view.runtime, status: 'failed', error_code: 'materialization_changed' }
+    const result = mount(); await ready()
+    expect(screen.getByRole('alert')).toHaveTextContent('The agent file changed outside this page.')
+    expect(result.dirty).toHaveBeenLastCalledWith(false)
+    await review()
+    expect(previewBodies).toEqual([{ revision: 'r1', enroll: false, operations: [], accept_parent: [], accept_members: [] }])
+    fireEvent.click(screen.getByRole('button', { name: 'Save reviewed changes' }))
+    await waitFor(() => expect(result.saved).toHaveBeenCalledOnce())
+    expect(saveBodies).toEqual([{ ...previewBodies[0], preview_token: 'signed-preview' }])
+  })
+
+  it('names the setting this page cannot show when save refuses a drifted file', async () => {
+    view.runtime = { ...view.runtime, status: 'failed', error_code: 'materialization_changed' }
+    server.use(http.put(endpoint, () => HttpResponse.json({ error: 'unreviewable_drift', code: 'unreviewable_drift', keys: ['toolsSettings'], file: 'crew-abc.json' }, { status: 409 })))
+    const result = mount(); await ready()
+    await review()
+    fireEvent.click(screen.getByRole('button', { name: 'Save reviewed changes' }))
+    // The refusal names the setting and the file, so the user is not sent hunting.
+    await screen.findByText(/crew-abc\.json changed in toolsSettings, a setting this page cannot show/)
+    expect(screen.queryByText(/The saved version changed/)).not.toBeInTheDocument()
+    expect(result.saved).not.toHaveBeenCalled()
+  })
+
+  it('keeps Review disabled with no edit when the saved file is intact', async () => {
+    mount(); await ready()
+    expect(screen.getByRole('button', { name: 'Review changes' })).toBeDisabled()
+  })
+
   it('previews before saving and sends the identical draft with its signed token', async () => {
     const result = mount(); await ready()
     fireEvent.click(screen.getByRole('tab', { name: 'Tools', exact: true }))

@@ -100,6 +100,20 @@ async def api_member_capabilities(request: web.Request) -> web.Response:
             )
         return web.json_response(result)
     except CapabilityError as exc:
+        if exc.keys:
+            # Key NAMES and the file's basename only, already bounded by the
+            # service: the pane names the settings a refusal is about instead
+            # of sending the user hunting. Literal bodies keep `code` visible
+            # to the error-code contract scan.
+            return web.json_response(
+                {
+                    "error": exc.code,
+                    "code": exc.code,
+                    "keys": list(exc.keys),
+                    "file": exc.file,
+                },
+                status=exc.status,
+            )
         return web.json_response({"error": exc.code, "code": exc.code}, status=exc.status)
     except (OSError, ValueError):
         # Source/sidecar/parser errors may quote secret-bearing bytes or paths.
