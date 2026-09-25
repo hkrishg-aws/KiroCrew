@@ -3915,16 +3915,17 @@ def _panel_owner_record(own: Mapping[str, Any], owners_omitted: int) -> dict[str
     ``history_omitted`` is the bound speaking: it is how a reader tells a history
     trimmed at its cap from one that holds every cycle the crew ever published.
 
-    *owners_omitted* is the SLOT's own eviction count, and it is carried on every
-    record because this is the record a reader selects: the reader hint in
-    ``docs/reference/crew-log/session-types.md`` says to read the fold for the
-    member's slot and then take the record under the asking crew's ``crew_key``. A
-    slot-level count reachable only from the top level is therefore invisible to
-    that reader, while the count exists precisely so a reader can tell a slot that
-    evicted this crew from a slot this crew never published on -- the one question
-    an empty record cannot answer about itself. Required rather than defaulted,
-    because a caller that omitted it would report "nothing was evicted", which is a
-    wrong answer rather than a missing one.
+    *owners_omitted* is the SLOT's own truncation count, and that is the whole of
+    what it says: this slot has evicted that many owners. It is carried on each
+    record so a reader holding one does not need a second lookup to learn the slot
+    truncated. It deliberately does NOT tell a crew whether IT was the evicted one:
+    the count rises on any owner's eviction without reference to a key, and eviction
+    deletes the entry outright, so no reading here attributes a loss to a particular
+    crew. ``0`` says this fold recorded no eviction, and not that a crew with no record
+    never published -- the append is best-effort, so an unlanded entry leaves the fold
+    empty while the store's file still holds the panel. Required rather than defaulted,
+    because a caller that omitted it would report "this slot evicted nobody", which is
+    a wrong answer rather than a missing one.
     """
     return {
         "schema": PANEL_SCHEMA_VERSION,
@@ -3960,11 +3961,15 @@ def _panel_render(state: dict[str, Any]) -> dict[str, Any]:
     no template, so no real record has one.
 
     ``owners_omitted`` is the owner bound speaking, beside each record's own
-    ``history_omitted``: without it a slot that evicted a crew reads exactly like a
-    slot that crew never published on. It sits on EVERY record here, the per-owner
-    ones included, because the per-owner record is the one a reader is told to
-    select -- a count only the top level carried would be unreachable by the reader
-    the reference page sanctions.
+    ``history_omitted``, and it speaks only about THIS FOLD. It rises on the eviction
+    of any owner with no reference to any particular key, so a non-zero value says the
+    slot truncated and cannot say whom -- a crew that never published on a slot four
+    others filled reads exactly what a genuinely evicted crew reads. ``0`` says this
+    fold recorded no eviction, which is NOT the same as "this crew never published":
+    the append is best-effort, so a publish whose entry never landed leaves no record
+    here while the store's file still holds that crew's panel. Attribution is
+    unavailable at any level, because eviction deletes the owner's entry and with it
+    the only thing that could name the evicted crew.
     """
     owners: dict[str, Any] = state["owners"]
     omitted = _as_int(state.get("owners_omitted"))

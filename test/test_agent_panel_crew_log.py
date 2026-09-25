@@ -555,16 +555,19 @@ def _reader_hint() -> str:
     return para
 
 
-def test_the_record_a_reader_is_told_to_select_carries_the_whole_shape():
-    """Every field the fold's top level has, the per-owner record has too.
+def test_the_record_a_reader_selects_carries_the_same_shape_as_the_top_level():
+    """The per-owner record and the top level agree on every field but ``owners``.
 
     The reference page tells a reader to select the record under the asking crew's
-    ``crew_key``, so that per-owner record -- not the top level -- is the shape the
-    sanctioned reader actually gets. A field reachable only from the top level is
-    therefore a field no reader following the documented path can see.
+    ``crew_key``, so that per-owner record is what a sanctioned reader usually holds.
+    Keeping the two shapes identical is what stops a reader that holds one from
+    silently missing a field the other has -- not because the top level is
+    unreachable (a reader that selected a record read the fold to do it), but because
+    a field on only one of them is a field whose location a reader has to know
+    out of band.
 
     Derived by COMPARING the two shapes rather than by listing the fields, so a
-    tenth field set on the top level alone reds this without the test being edited.
+    tenth field set on one side alone reds this without the test being edited.
     ``owners`` is the container that holds the per-owner records, so it is the one
     key the top level is expected to have alone.
     """
@@ -574,36 +577,91 @@ def test_the_record_a_reader_is_told_to_select_carries_the_whole_shape():
     value = _folded()
     mine = value["owners"][KEY]
     top_only = set(value) - set(mine)
-    assert top_only == {"owners"}, f"reachable only from the top level: {sorted(top_only)}"
+    owner_only = set(mine) - set(value)
+    assert top_only == {"owners"}, f"on the top level alone: {sorted(top_only)}"
+    assert not owner_only, f"on the per-owner record alone: {sorted(owner_only)}"
 
 
-def test_every_field_the_reader_hint_names_is_on_the_record_it_names():
-    """The hint may not promise a field the record it points at does not carry.
+def test_every_field_the_reader_hint_names_is_reachable_along_the_hints_own_path():
+    """The hint may not name a field a reader following it cannot reach.
 
-    This is the contradiction itself, pinned from both ends: the hint names the
-    selection (the record under the crew's ``crew_key``) and it names fields in
-    backticks. A field named there that the selected record lacks is a documented
-    contract the implementation does not keep, which is exactly how
-    ``owners_omitted`` came to be unreachable -- it was set on the top level while
-    the hint sent every reader one level down.
+    The hint sends a reader to the fold for the slot and then to the record under
+    its ``crew_key``, so both the fold's top level and that per-owner record are in
+    a compliant reader's hands. A backticked field on NEITHER is a documented
+    contract the implementation does not keep.
+
+    Deliberately not "must be on the per-owner record": eviction deletes an owner's
+    entry, so the count that answers an evicted reader can only live on the top
+    level, and a pin demanding per-owner presence would be asserting the very thing
+    the fold cannot do.
     """
     _unit()
     _publish(title="fleet", data={"cycle": 47})
-    mine = _folded()["owners"][KEY]
+    value = _folded()
+    reachable = set(value) | set(value["owners"][KEY])
 
     named = set(re.findall(r"`([a-z_]+)`", _reader_hint()))
     assert named, "the hint names no field in backticks; re-anchor this pin"
-    missing = sorted(name for name in named if name not in mine)
-    assert not missing, f"the hint names {len(named)} fields; absent from the record: {missing}"
+    missing = sorted(name for name in named if name not in reachable)
+    assert not missing, f"the hint names {len(named)} fields; unreachable: {missing}"
 
 
-def test_an_eviction_is_visible_from_the_surviving_crews_own_record():
-    """The reader path end to end: select by ``crew_key``, read the eviction count.
+def test_an_evicted_crew_has_no_record_and_reads_the_count_from_the_top_level():
+    """The evicted reader's whole path, which is the case the count exists for.
 
-    Without this the fold's own promise is unkeepable by the documented reader: a
-    slot that evicted a crew reads exactly like a slot that crew never published
-    on, and the count that separates them sat one level above where the reader was
-    sent.
+    Eviction is ``del owners[oldest]``, so a crew whose record was evicted finds
+    NOTHING under its own ``crew_key`` -- not an empty record. Every per-owner copy
+    of ``owners_omitted`` therefore belongs to a crew that survived, and none of them
+    can answer "was I evicted". The fold's top-level count is what answers it, and
+    this pins that it is there and non-zero in exactly that state.
+    """
+    _unit()
+    keys = [chr(ord("c") + i) * 40 for i in range(PANEL_OWNER_LIMIT + 1)]
+    for i, key in enumerate(keys):
+        _publish(crew_key=key, title=f"crew-{i}", data={"cycle": i})
+
+    value = _folded()
+    evicted = keys[0]
+    assert len(value["owners"]) == PANEL_OWNER_LIMIT
+    # Absent, not empty: there is no record here to carry a count of its own.
+    assert evicted not in value["owners"]
+    assert value["owners"].get(evicted) is None
+    # So the top level is the only thing that can tell this reader it was evicted.
+    assert value["owners_omitted"] == 1
+
+
+def test_no_record_under_owners_is_ever_empty_so_absence_is_the_only_signal():
+    """An "empty record under ``owners``" is not a state the fold can produce.
+
+    ``_panel_step`` assigns a validated non-empty ``template`` on insert, so every
+    record under ``owners`` describes a real publish. The only empty-``template``
+    record ``_panel_render`` emits is its top-level fallback, reached when no crew
+    has published at all -- where the eviction count is necessarily zero.
+
+    Pinned because it is what makes ABSENCE the evicted reader's signal. A reader
+    told to look for an empty record under its key would be waiting for a state that
+    never arrives.
+    """
+    _unit()
+    keys = [chr(ord("c") + i) * 40 for i in range(PANEL_OWNER_LIMIT + 1)]
+    for i, key in enumerate(keys):
+        _publish(crew_key=key, title=f"crew-{i}", data={"cycle": i})
+
+    templates = [record["template"] for record in _folded()["owners"].values()]
+    assert templates and all(templates), templates
+
+    # The one empty-template record the fold emits, and its count is zero there.
+    fresh = crew_log.read_slot_projection("member-nobody-published", PANEL_FOLD_NAME).value
+    assert fresh["template"] == ""
+    assert fresh["owners_omitted"] == 0
+
+
+def test_the_per_owner_count_agrees_with_the_top_level():
+    """The copies must not drift from the count they copy.
+
+    A per-owner ``owners_omitted`` that disagreed with the top level would be worse
+    than absent: two readers of the same fold would report different truncation for
+    one slot.
     """
     _unit()
     keys = [chr(ord("c") + i) * 40 for i in range(PANEL_OWNER_LIMIT + 2)]
@@ -611,11 +669,58 @@ def test_an_eviction_is_visible_from_the_surviving_crews_own_record():
         _publish(crew_key=key, title=f"crew-{i}", data={"cycle": i})
 
     value = _folded()
-    survivor = keys[-1]
-    assert survivor in value["owners"], "the newest publisher must have survived"
-    assert value["owners"][survivor]["owners_omitted"] == 2
-    # The same count the top level reports, so the two cannot drift apart.
-    assert value["owners_omitted"] == value["owners"][survivor]["owners_omitted"]
+    assert value["owners_omitted"] == 2
+    for key, record in value["owners"].items():
+        assert record["owners_omitted"] == value["owners_omitted"], key
+
+
+def test_a_non_zero_count_does_not_attribute_the_loss_to_the_asking_crew():
+    """The false-positive direction, which the count genuinely cannot rule out.
+
+    ``_panel_step`` increments on ANY owner's eviction with no reference to the
+    asking key, so a crew that never published on a busy slot reads exactly what a
+    genuinely evicted crew reads: no record of its own, and the same non-zero count.
+    Pinned so the documentation can never be tightened back into claiming an
+    attribution, and so the true-positive pin above is not mistaken for the whole
+    guarantee.
+    """
+    _unit()
+    publishers = [chr(ord("c") + i) * 40 for i in range(PANEL_OWNER_LIMIT + 1)]
+    for i, key in enumerate(publishers):
+        _publish(crew_key=key, title=f"crew-{i}", data={"cycle": i})
+
+    value = _folded()
+    evicted = publishers[0]
+    never_published = "z" * 40
+
+    # Both read absence, and both read the same count. Indistinguishable by design.
+    assert evicted not in value["owners"]
+    assert never_published not in value["owners"]
+    assert value["owners_omitted"] == 1
+
+
+def test_a_zero_count_speaks_only_about_this_fold_not_about_publishing():
+    """``0`` says this FOLD recorded no eviction. It says nothing about publishing.
+
+    The distinction is load-bearing because the append is best-effort:
+    ``api_agent_panel_publish`` writes the durable file and then skips the entry when
+    the crew log is off, when the session has no unit, or when the line does not fit.
+    Each of those leaves the fold with no record under that ``crew_key`` while the
+    count is still ``0`` and the file is still serving that crew's panel -- so reading
+    ``0`` as "this crew never published" is wrong in exactly the case the store is
+    designed to survive.
+
+    The fixture is that case: nothing is appended at all, which is what an unlanded
+    publish looks like from the fold's side.
+    """
+    _unit()
+
+    value = _folded()
+    assert value["owners_omitted"] == 0, "no eviction was recorded by this fold"
+    assert value["owners"] == {}, "and the fold holds no record for anyone"
+    # What the fold cannot distinguish: a crew that never published from one whose
+    # publish landed in the file while its entry was skipped.
+    assert value["template"] == "", "the fold says only that it has nothing recorded"
 
 
 def test_a_slot_that_evicted_nobody_says_so_on_the_selected_record():

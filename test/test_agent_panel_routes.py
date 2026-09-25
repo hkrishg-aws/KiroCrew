@@ -1005,18 +1005,6 @@ def test_every_refusal_in_the_crew_resolver_audits_its_denial():
     assert audits(tree.body[0].body) == []
 
 
-#: RED on current main, and it stays red until the direction for the drawer's own
-#: response is ruled on: widen the response to serve what the fold carries, or drop
-#: a carry that has no consumer. ``strict`` on purpose, following
-#: ``test_slot_detail_disk_window_authority_7526.py`` -- whoever lands either fix
-#: gets a failure here telling them to delete this marker, so the reproduction
-#: cannot rot into a silently-passing test.
-NO_CONSUMER = pytest.mark.xfail(
-    strict=True,
-    reason="#13896: _panel_record carries three fields the response and CrewPanelMeta both drop",
-)
-
-
 def _carried_by_panel_record() -> frozenset[str]:
     """Field names ``_panel_record`` copies off the fold onto the stored record.
 
@@ -1076,19 +1064,27 @@ def _declared_by_crew_panel_meta() -> frozenset[str]:
     return frozenset(re.findall(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:", body, re.MULTILINE))
 
 
-@NO_CONSUMER
 def test_every_field_the_drawer_read_carries_has_a_consumer():
     """A field the read path goes out of its way to carry must reach somebody.
 
-    ``_panel_record`` copies fields off the fold onto the record it returns, and the
-    route then builds its response as a hand-typed literal. Anything carried but not
-    named there is dropped at the wire on every branch, and ``CrewPanelMeta`` -- the
-    browser's own declaration -- is the other place a consumer could live. A field
-    in neither is live code with nothing downstream of it.
+    THIS ASSERTION FAILS ON CURRENT MAIN, and that is the point: it reports a real
+    contract violation in executable form. ``_panel_record`` copies ``history``,
+    ``publishes`` and ``history_omitted`` off the fold onto the record it returns,
+    and ``api_member_panel`` then builds its response as a hand-typed five-key
+    literal. Anything carried but not named there is dropped at the wire on every
+    branch, and ``CrewPanelMeta`` -- the browser's own declaration -- is the other
+    place a consumer could live. These three are in neither.
 
-    Both sides are enumerated FROM SOURCE so a future panel-serving route, or a
-    fourth carried field, is covered by the same assertion rather than by somebody
-    remembering to extend a list.
+    Do NOT mark this expected-failure and do NOT delete the carry to green it. An
+    expected-failure marker turns "the code violates this contract" into "we have
+    decided not to care", and it is the shape the ratchet rule in ``AUTOSDE.yaml``
+    exists to keep out of the suite. The two honest resolutions are to widen the
+    response to serve what the fold carries, or to drop a carry that has no
+    consumer; either one makes this pass by fixing the thing it names.
+
+    All three sides are enumerated FROM SOURCE, so a fourth carried field or a
+    second panel-serving route is covered by the same assertion rather than by
+    somebody remembering to extend a list.
     """
     carried = _carried_by_panel_record()
     served = _served_by_the_drawer_response()
@@ -1105,18 +1101,19 @@ def test_every_field_the_drawer_read_carries_has_a_consumer():
 
 
 def test_the_consumer_pin_reads_all_three_sides_before_it_judges():
-    """The control for the pin above, and it must pass whichever direction is taken.
+    """The control, so the red above is a real disagreement and not a bad parse.
 
-    A strict xfail proves a disagreement exists; it cannot prove the three readers
-    that measure it work, because a reader returning nothing would fail the same
-    way. Asserted here so the red above is a real disagreement rather than a broken
-    parse: each side is non-empty, and the served set is exactly what the response
-    declares, which is the side a reader can check by eye.
+    Three readers that all returned nothing would make the assertion above fail the
+    same way a genuine violation does, which is the one way its red could mean
+    nothing. Each side is therefore counted here, and the served set is spelled out
+    because it is the side a reader can check against the route by eye. This test
+    PASSES; its neighbour's failure is the finding.
     """
     carried = _carried_by_panel_record()
     served = _served_by_the_drawer_response()
     declared = _declared_by_crew_panel_meta()
     assert len(carried) == 3, sorted(carried)
+    assert sorted(carried) == ["history", "history_omitted", "publishes"], sorted(carried)
     assert served == {"template", "title", "crew", "published_at", "data"}, sorted(served)
     # The browser declares the same five, which is why the carry reaches no reader
     # through that side either.
