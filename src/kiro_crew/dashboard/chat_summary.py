@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any
 from kiro_crew.acp.types import STOP_REASON_END_TURN
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.dashboard.chat_utils import effective_session_key, slot_history_key
-from kiro_crew.history import is_incognito_transcript
+from kiro_crew.history import is_incognito_transcript, transcript_withholds_derivation
 from kiro_crew.llm_helpers import _extract_json_of_type, run_bg_oneliner
 from kiro_crew.session_summary import (
     count_user_turns,
@@ -342,7 +342,20 @@ async def _generate_locked(
     # sidecar -- earlier intents would silently vanish from the panel. Disk is
     # the same source the history endpoint serves, and extract_turns bounds
     # what the model actually reads.
+    #
+    # Because the rows come from DISK, the file's own privacy contract gates them
+    # too, not only the live slot's mode the first pass checked: another writer
+    # (a second gateway on this data home, a same-key hand-over, a subagent or
+    # cron appending) may have tightened the line while this slot still reads
+    # persistent in memory. Asked before the read and again after it, so a
+    # tightening that lands in between is caught; an unreadable line refuses.
+    if await asyncio.to_thread(transcript_withholds_derivation, log, key):
+        logger.debug("Session summary skipped for %s: memory_mode (on-disk line)", key)
+        return False
     records = await asyncio.to_thread(log.read_messages_chained, key)
+    if await asyncio.to_thread(transcript_withholds_derivation, log, key):
+        logger.debug("Session summary skipped for %s: memory_mode (line tightened)", key)
+        return False
     turns = extract_turns(
         records,
         assistant_excerpt_chars=cfg.session_summary.assistant_excerpt_chars,

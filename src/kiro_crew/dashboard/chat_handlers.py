@@ -3792,6 +3792,73 @@ def _report_lost_queued_prompts(
         )
 
 
+def _tighten_replacement_to_restricted_original(
+    state: DashboardState, name: str, slot: _ChatSlot
+) -> None:
+    """Make the live replacement at ``name`` at least as restricted as ``slot``.
+
+    The hand-over lands a closing original's rows in a transcript file a same-key
+    replacement is still writing, and the file's ``memory_mode`` line is a ratchet
+    that ends up at the stricter of the two modes whichever write comes first
+    (``_save_slot_to_history``). The line gates every reader that learns from the
+    FILE, but the readers that gate on the LIVE slot -- the session summary and the
+    export both read ``slot.memory_mode`` and then read the whole transcript from
+    disk -- would still see a persistent replacement and hand the original's
+    private rows to a model or a file. So the replacement's own mode is tightened
+    here, in process, BEFORE the rows are written: the moment they exist on disk
+    the slot that shares them is already restricted.
+
+    Any live carrier or vouched entry for the replacement's session is released
+    with it: a restricted session is never vouched for, and the durable record the
+    save tightens in the same write is what the next read then returns, so the
+    next turn-start binding takes the restricted branch exactly as it would for a
+    replacement born onto a restricted line. Only the mode moves -- the
+    replacement's title, folder, tags, pin and store selection are its own -- and
+    only ever tighter; a persistent original over a restricted replacement changes
+    nothing. The key-scoped restricted marker is re-derived by the caller's
+    ``_resettle_restricted_key`` from the mode set here.
+
+    Kept even when the write that follows fails: the tightening precedes the write
+    on purpose, and undoing it would need proof that no private row reached the
+    file, which a failed write cannot give. Restricting a replacement whose rows
+    never landed costs it learning from a chat that was about to hold private
+    rows; the other error hands private rows to a model.
+    """
+    from kiro_crew.execution_context import (
+        canonical_memory_mode,
+        clear_session_execution,
+        stricter_memory_mode,
+    )
+
+    replacement = state._slots.get(name)
+    if replacement is None or replacement is slot:
+        return
+    if not _replacement_shares_transcript(state, name, slot):
+        # A replacement writing a DIFFERENT file (a linked-key original, an unbound
+        # replacement) never holds the original's rows; its mode is its own.
+        return
+    if not slot.messages and slot._disk_older_count <= 0:
+        # The original never had a row -- none committed, none owed -- so the
+        # shared file holds nothing of it and there is nothing to protect.
+        return
+    current = canonical_memory_mode(getattr(replacement, "memory_mode", "persistent"))
+    retained = stricter_memory_mode(
+        current, canonical_memory_mode(getattr(slot, "memory_mode", "persistent"))
+    )
+    if retained == current:
+        return
+    replacement.memory_mode = retained
+    clear_session_execution(effective_session_key(replacement))
+    logger.info(
+        "Slot %s: the replacement holding this key was tightened from %s to %s because "
+        "it shares the transcript of the %s original being closed",
+        name,
+        current,
+        retained,
+        retained,
+    )
+
+
 async def _persist_handover_tail(
     state: DashboardState, name: str, slot: _ChatSlot
 ) -> _HandoverDrainResult:
@@ -3873,6 +3940,7 @@ async def _persist_handover_tail(
     a change to what a durable metadata line MEANS for a key two slots share;
     the write stays as it is, and the loss is reported rather than silent.
     """
+    _tighten_replacement_to_restricted_original(state, name, slot)
     try:
         slot.flush_deferred_notes()
     except Exception:

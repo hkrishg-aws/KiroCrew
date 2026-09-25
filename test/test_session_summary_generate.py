@@ -172,6 +172,53 @@ class TestGating:
         assert called == []
         assert state.conversation_log.get_cached_intent_summary(state.hkey) is None
 
+    @pytest.mark.parametrize("line_mode", ["incognito", "temporary", "Incognito"])
+    async def test_a_restricted_on_disk_line_refuses_a_slot_that_still_reads_persistent(
+        self, env, monkeypatch, line_mode
+    ):
+        """The rows come from DISK, so the file's own contract gates them.
+
+        Another writer -- a second gateway on this data home, a same-key
+        hand-over, a subagent appending -- can tighten the line while this slot
+        still reads persistent in memory. The slot gate passes; the file must not.
+        """
+        state, slot = env
+        assert slot.memory_mode == "persistent"
+        state.conversation_log.update_metadata(state.hkey, {"memory_mode": line_mode})
+        called = []
+        _stub_llm(monkeypatch, _GOOD_REPLY, called)
+        assert await chat_summary.generate_session_summary(state, slot, cfg=_cfg()) is False
+        assert called == []
+        assert state.conversation_log.get_cached_intent_summary(state.hkey) is None
+
+    async def test_a_line_tightened_during_the_transcript_read_is_refused(self, env, monkeypatch):
+        """The gate is asked again AFTER the read, so a tightening in between is caught."""
+        state, slot = env
+        log = state.conversation_log
+        real_read = log.read_messages_chained
+
+        def _read_then_tighten(key):
+            records = real_read(key)
+            log.update_metadata(key, {"memory_mode": "incognito"})
+            return records
+
+        monkeypatch.setattr(log, "read_messages_chained", _read_then_tighten)
+        called = []
+        _stub_llm(monkeypatch, _GOOD_REPLY, called)
+        assert await chat_summary.generate_session_summary(state, slot, cfg=_cfg()) is False
+        assert called == []
+        assert log.get_cached_intent_summary(state.hkey) is None
+
+    async def test_an_unreadable_on_disk_line_refuses(self, env, monkeypatch):
+        """Fail closed: a reader that cannot see the contract does not act on the rows."""
+        state, slot = env
+        log = state.conversation_log
+        monkeypatch.setattr(log, "get_metadata_status", lambda _key: ({}, False))
+        called = []
+        _stub_llm(monkeypatch, _GOOD_REPLY, called)
+        assert await chat_summary.generate_session_summary(state, slot, cfg=_cfg()) is False
+        assert called == []
+
     async def test_an_unclean_stop_reason_skips(self, env, monkeypatch):
         """A turn cut short by a timeout or stall did not really finish."""
         state, slot = env

@@ -346,6 +346,66 @@ class TestGetChatSessionWorkspaceGate:
         assert "secret beta content" in out
 
 
+class TestLineTightenedBetweenCheckAndRead:
+    """The privacy gate is re-asked AFTER the rows are read.
+
+    Both tools check the metadata line, then read rows. A writer -- a same-key
+    hand-over landing a restricted tab's rows, a second gateway on the same data
+    home -- can tighten the line between the two, and a reader that trusted its
+    first look would hand back rows the file now says are private. The re-check
+    reads the line as it is once the rows are in hand.
+    """
+
+    @staticmethod
+    def _tighten_on_read(monkeypatch, method_name):
+        real = getattr(ConversationLog, method_name)
+
+        def _read_then_tighten(self, key, *args, **kwargs):
+            rows = real(self, key, *args, **kwargs)
+            self.update_metadata(key, {"memory_mode": "incognito"})
+            return rows
+
+        monkeypatch.setattr(ConversationLog, method_name, _read_then_tighten)
+
+    def test_search_drops_a_session_tightened_during_its_row_read(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        _seed_sessions(tmp_path)
+        self._tighten_on_read(monkeypatch, "read_messages")
+        out = mcp_core._call_tool_inner("search_chat_history", {"query": "redis"})
+        assert "dashboard_chat-1" not in out
+        assert "redis.timeout" not in out
+
+    def test_get_chat_session_refuses_a_session_tightened_during_its_row_read(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        _seed_sessions(tmp_path)
+        self._tighten_on_read(monkeypatch, "recent")
+        out = mcp_core._call_tool_inner("get_chat_session", {"session_key": "dashboard_chat-1"})
+        assert "private" in out
+        assert "redis.timeout" not in out
+
+    def test_get_chat_session_refuses_an_unreadable_line_after_the_read(
+        self, tmp_path, monkeypatch
+    ):
+        """Fail closed: a line that cannot be read once the rows are in hand."""
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        _seed_sessions(tmp_path)
+        # The first look goes through ``get_metadata`` (a bare dict, unreadable
+        # reads as {}); the re-check is the one caller of the status form here.
+        real_status = ConversationLog.get_metadata_status
+
+        def _unreadable(self, key):
+            if key == "dashboard_chat-1":
+                return {}, False
+            return real_status(self, key)
+
+        monkeypatch.setattr(ConversationLog, "get_metadata_status", _unreadable)
+        out = mcp_core._call_tool_inner("get_chat_session", {"session_key": "dashboard_chat-1"})
+        assert "private" in out
+        assert "redis.timeout" not in out
+
+
 class TestPostMergeHardening:
     """Post-merge security-review hardening regressions."""
 

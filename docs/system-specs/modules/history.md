@@ -848,18 +848,59 @@ writer:
   unsaved tail with `rows_only=True`, which defers every slot-owned field —
   `memory_mode` included — to the line a same-key replacement published. A
   restricted original draining onto a PERSISTENT replacement's line would
-  therefore put private rows under a line that says persistent, and the line
-  cannot be tightened from the drain (it is the live replacement's own line,
-  over that slot's persistent rows, and a rows-only write owns none of its
-  fields). The save refuses that write (`False`, nothing written) when the
-  retained mode is stricter than the line's, and the drain reports the rows as
-  lost exactly as it reports a failed write — a 500 `history_save_failed` on
-  the close, a log line naming the count. The reverse (a persistent tail onto a
-  restricted line) commits and keeps the line's stricter mode, as
-  stricter-wins requires. The refusal is reachable only when the original
-  committed nothing before the close: a line it had published ratchets the
-  replacement's own save down to the restricted mode, so the drain then lands
-  the tail under it.
+  therefore put private rows under a line that says persistent. The line is a
+  ratchet any writer may tighten, so when the retained mode is stricter than
+  the line's the drain folds it in and TIGHTENS the line — `memory_mode`
+  becomes the stricter value and a carried `memory_store` is dropped, since a
+  restricted line names no store — and the rows land under it; the
+  replacement's title, folder, tags and pin are not the drain's and stay. The
+  LIVE replacement is tightened with it, in process and before the write
+  (`_tighten_replacement_to_restricted_original`): the session summary and the
+  export gate on `slot.memory_mode` and then read the whole transcript from
+  disk, so a persistent replacement would hand the original's rows to a model
+  or a file. Its live carrier / vouched entry is released; the durable
+  `execution_context` record carried on the line is folded to the line's mode
+  by the same save (`_tighten_carried_execution`, also on the full-save carry),
+  and `read_session_execution` folds the line's canonical `memory_mode` into
+  any durable record it returns, so no carrier-first reader or binder answers
+  looser than the line even for a hand-edited header. This is the same file the
+  other race order reaches: a line the original had committed ratchets the
+  replacement's own save down to the restricted mode.
+  Refusing instead would lose the reply the user was watching with no retry
+  path (the slot is popped), which is why the drain tightens rather than
+  refuses. The reverse (a persistent tail onto a restricted line) commits and
+  keeps the line's stricter mode untouched, as stricter-wins requires. The
+  tightening is reachable only when the original committed nothing before the
+  close; the replacement's next full save folds the tightened line back in, so
+  the ratchet holds.
+- **Readers that take rows from disk gate on the disk line too.** Several
+  readers check a mode and then read rows from disk, and the two can disagree:
+  a LIVE slot can lag its file (a same-key persistent recreation of a closed
+  restricted tab; another writer -- a second gateway on the same data home, a
+  hand-over drain, a subagent or cron appending -- tightening the line while the
+  slot still reads persistent in memory), and a line read once is a snapshot a
+  writer can tighten before the rows are read. Each such reader therefore asks
+  `history.transcript_withholds_derivation(log, key)` -- the on-disk line's
+  `memory_mode` through `is_incognito_transcript`, failing CLOSED on an
+  unreadable line, an absent file being no refusal -- AFTER its row read, and
+  the disk-only readers BEFORE it as well:
+  - the session summary (`chat_summary`), around its transcript read; a refusal
+    skips with reason `memory_mode`;
+  - every transfer bundle (`session_transfer._read_chained_history`, shared by
+    the file export and the tunnel send), before and after the read, raising
+    `TranscriptWithheld`; the export answers 400 `export_slot_not_persistent`
+    and the tunnel 400 `transfer_slot_not_persistent`, each auditing `denied`,
+    nothing built or sent;
+  - the suggestions prompt (`suggestions._build_context`) after `recent()`,
+    dropping the session; and the MCP history tools (`search_chat_history`
+    after its snippet read, dropping the row; `get_chat_session` after
+    `recent()`, refusing as `refused_incognito`);
+  - the consolidator: `snapshot_for_consolidation(key, withhold_restricted=True)`
+    reads the line under the SAME lock as the rows and raises
+    `ConsolidationWithheld` on a restricted or unreadable line, at the pre-turn
+    snapshot (no model turn) and at the write-boundary snapshot (the result is
+    discarded); `_consolidate` maps it to `_CONSOLIDATION_REFUSED` with no
+    failure charge. Skill detection re-asks the line after its own read.
 - **The suggestions builder skips restricted transcripts.**
   `suggestions._build_context` walks `list_sessions()` and pulls each
   session's last user messages into a prompt shipped to the model and cached

@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 from aiohttp import web
 
 from kiro_crew.context import ContextBuilder
-from kiro_crew.history import is_incognito_transcript
+from kiro_crew.history import is_incognito_transcript, transcript_withholds_derivation
 from kiro_crew.llm_helpers import run_bg_oneliner
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.memory_stores import DEFAULT_MEMORY_STORE
@@ -116,6 +116,13 @@ def _build_context(state: DashboardState) -> str:
                     line = f"- **{title or key}**"
                     try:
                         recent = state.conversation_log.recent(key, max_messages=6)
+                        # Re-asked AFTER the read: the listing row above was a
+                        # snapshot, and a writer can tighten the line between it
+                        # and the rows (a same-key hand-over landing private rows
+                        # under a line that was persistent a moment ago). Fails
+                        # closed on an unreadable line.
+                        if transcript_withholds_derivation(state.conversation_log, key):
+                            continue
                         user_msgs = [
                             m["content"][:150]
                             for m in recent

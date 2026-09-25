@@ -34,11 +34,19 @@ from kiro_crew.dashboard.session_transfer import (
 
 
 class _FakeLog:
-    def __init__(self, messages):
+    def __init__(self, messages, *, metadata=None, readable=True):
         self._messages = messages
+        # The on-disk metadata line the export's file-level privacy gate reads.
+        # ``None`` metadata models an absent file; ``readable=False`` a line that
+        # exists but cannot be read.
+        self.metadata = {} if metadata is None else dict(metadata)
+        self.readable = readable
 
     def read_messages_chained(self, _key):
         return list(self._messages)
+
+    def get_metadata_status(self, _key):
+        return dict(self.metadata), self.readable
 
 
 def _slot(messages, *, title="My session", memory_mode="persistent", app="", **over):
@@ -445,6 +453,59 @@ async def test_incognito_and_temporary_sessions_are_refused():
 
         assert resp.status == 400, mode
         assert json.loads(resp.body)["code"] == "export_slot_not_persistent"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("line_mode", ["incognito", "temporary", "Incognito"])
+async def test_a_restricted_on_disk_line_refuses_a_slot_that_still_reads_persistent(line_mode):
+    """The bundle is built from DISK, so the file's own contract gates it.
+
+    Another writer -- a second gateway on this data home, a same-key hand-over, a
+    subagent appending -- can tighten the line while this slot still reads
+    persistent in memory. The live-slot gate above passes; the file must not.
+    """
+    slot = _slot(MSGS, memory_mode="persistent")
+    state = _state(MSGS, slots={"slot-1": slot})
+    state.conversation_log.metadata = {"memory_mode": line_mode}
+
+    resp = await se.api_chat_slot_export(_request(state))
+
+    assert resp.status == 400
+    assert json.loads(resp.body)["code"] == "export_slot_not_persistent"
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_on_disk_line_refuses_the_export():
+    """Fail closed: a reader that cannot see the contract does not ship the rows."""
+    slot = _slot(MSGS, memory_mode="persistent")
+    state = _state(MSGS, slots={"slot-1": slot})
+    state.conversation_log.readable = False
+
+    resp = await se.api_chat_slot_export(_request(state))
+
+    assert resp.status == 400
+    assert json.loads(resp.body)["code"] == "export_slot_not_persistent"
+
+
+@pytest.mark.asyncio
+async def test_a_line_tightened_while_the_bundle_was_built_is_refused(monkeypatch):
+    """The gate is asked again AFTER the build, so a tightening in between is caught."""
+    slot = _slot(MSGS, memory_mode="persistent")
+    state = _state(MSGS, slots={"slot-1": slot})
+    log = state.conversation_log
+    real_read = log.read_messages_chained
+
+    def _read_then_tighten(key):
+        rows = real_read(key)
+        log.metadata = {"memory_mode": "incognito"}
+        return rows
+
+    monkeypatch.setattr(log, "read_messages_chained", _read_then_tighten)
+
+    resp = await se.api_chat_slot_export(_request(state))
+
+    assert resp.status == 400
+    assert json.loads(resp.body)["code"] == "export_slot_not_persistent"
 
 
 @pytest.mark.asyncio

@@ -78,6 +78,7 @@ from kiro_crew.config.loader import _raw_config
 from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
 from kiro_crew.dashboard.session_transfer import (
     SnapshotUnstable,
+    TranscriptWithheld,
     build_transfer_bundle_async,
     bundle_rejection_reason,
 )
@@ -284,13 +285,14 @@ async def api_chat_slot_export(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "session not found", "code": "export_slot_not_found"}, status=404
         )
-    if slot.memory_mode != "persistent":
+
+    def _refuse_restricted(reason: str) -> web.Response:
         # An incognito or temporary transcript is kept for the user's own History
         # and nothing is produced FROM it -- no lesson, no summary, no snapshot.
         # A bundle written into a file the user then stores somewhere is such a
         # product, so this is a refusal rather than a best-effort export of
         # whatever happens to be resident.
-        _audit("denied", error=f"memory_mode={slot.memory_mode}")
+        _audit("denied", error=reason)
         return web.json_response(
             {
                 "error": "cannot export an incognito or temporary session",
@@ -298,6 +300,9 @@ async def api_chat_slot_export(request: web.Request) -> web.Response:
             },
             status=400,
         )
+
+    if slot.memory_mode != "persistent":
+        return _refuse_restricted(f"memory_mode={slot.memory_mode}")
 
     try:
         bundle = await build_transfer_bundle_async(
@@ -343,6 +348,14 @@ async def api_chat_slot_export(request: web.Request) -> web.Response:
                 and is_owner_dashboard_request(request)
             ),
         )
+    except TranscriptWithheld as exc:
+        # The bundle is built from the transcript on DISK, and the file's own
+        # privacy contract gates it, not only the live slot's mode above: another
+        # writer (a second gateway on this data home, a same-key hand-over, a
+        # subagent or cron appending) may have tightened the line while this slot
+        # still reads persistent in memory. The builder checks the line before
+        # and after its read and raises; nothing was built or written.
+        return _refuse_restricted(f"on-disk line: {exc}")
     except SnapshotUnstable:
         # No consistent view of the source: a flush landed inside every retry, or
         # a rewind/regenerate rewrite is still owed so disk is stale. Retryable,

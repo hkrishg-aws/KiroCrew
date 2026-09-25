@@ -66,6 +66,119 @@ async def test_consolidation_captures_execution_off_loop(tmp_path, monkeypatch, 
     assert reads[0][1] == KEY
 
 
+class TestTheLineIsValidatedWithTheRows:
+    """The consolidator's privacy check reads the line, then snapshots rows.
+
+    A writer can tighten the line in between -- a same-key hand-over landing a
+    restricted tab's rows under a line that was persistent a moment ago. The
+    snapshot therefore re-reads the line under the SAME lock as the rows and
+    refuses them together, at both the pre-turn snapshot and the write-boundary
+    one, so no rows a restricted line governs reach the model or memory.
+    """
+
+    @staticmethod
+    def _tighten_before(log, method_name, monkeypatch, *, mode="incognito"):
+        """Tighten the line the first time *method_name* is entered on ``log``."""
+        real = getattr(type(log), method_name)
+        fired = {"done": False}
+
+        def _tighten_then_call(self, key, *args, **kwargs):
+            if not fired["done"]:
+                fired["done"] = True
+                with history_mod.allow_on_loop_persist():
+                    self.update_metadata(key, {"memory_mode": mode})
+            return real(self, key, *args, **kwargs)
+
+        monkeypatch.setattr(type(log), method_name, _tighten_then_call)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["incognito", "temporary", "Incognito"])
+    async def test_a_line_tightened_before_the_snapshot_refuses_without_a_model_turn(
+        self, tmp_path, monkeypatch, mode
+    ):
+        from kiro_crew.history_consolidation import _CONSOLIDATION_REFUSED
+
+        log = _seed_log(tmp_path)
+        c = _make_consolidator(log)
+        c._call_llm = AsyncMock(return_value={"history_entry": "leaked"})
+        # ``_locked`` is the snapshot's own lock acquisition: the line flips just
+        # before the rows are read under it, after the privacy pre-checks ran.
+        self._tighten_before(log, "_locked", monkeypatch, mode=mode)
+
+        outcome = await asyncio.wait_for(c._consolidate(KEY, include_history=True), 10)
+
+        assert outcome is _CONSOLIDATION_REFUSED
+        c._call_llm.assert_not_awaited()
+        c._memory.append_history.assert_not_called()
+        assert log.consolidation_counts(KEY)[1] == 3, "the span was marked consolidated"
+        assert log.get_metadata(KEY).get("consolidation_attempts", 0) in (
+            0,
+            None,
+        ), "a refusal was charged as a failed attempt"
+
+    @pytest.mark.asyncio
+    async def test_a_line_tightened_during_the_model_turn_discards_the_result(
+        self, tmp_path, monkeypatch
+    ):
+        from kiro_crew.history_consolidation import _CONSOLIDATION_REFUSED
+
+        log = _seed_log(tmp_path)
+        c = _make_consolidator(log)
+
+        async def response(_prompt, **_kwargs):
+            with history_mod.allow_on_loop_persist():
+                log.update_metadata(KEY, {"memory_mode": "incognito"})
+            return {"history_entry": "derived from rows now under a restricted line"}
+
+        with patch.object(c, "_call_llm", AsyncMock(side_effect=response)):
+            outcome = await asyncio.wait_for(c._consolidate(KEY, include_history=True), 10)
+
+        assert outcome is _CONSOLIDATION_REFUSED
+        c._memory.append_history.assert_not_called()
+        assert log.consolidation_counts(KEY)[1] == 3, "the span was marked consolidated"
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_line_under_the_snapshot_lock_refuses(self, tmp_path, monkeypatch):
+        """Fail closed: rows whose contract cannot be read are not derived from."""
+        from kiro_crew.history_consolidation import _CONSOLIDATION_REFUSED
+
+        log = _seed_log(tmp_path)
+        c = _make_consolidator(log)
+        c._call_llm = AsyncMock(return_value={"history_entry": "leaked"})
+        # Unreadable only from the snapshot's own lock hold onward, so the
+        # pre-checks (which read the line too) pass and the snapshot is the gate.
+        real_locked = type(log)._locked
+        real_status = type(log)._read_metadata_status
+        inside = {"lock": False}
+
+        def _locked_then_unreadable(self, key):
+            inside["lock"] = True
+            return real_locked(self, key)
+
+        def _status(self, key):
+            if inside["lock"] and key == KEY:
+                return {}, False
+            return real_status(self, key)
+
+        monkeypatch.setattr(type(log), "_locked", _locked_then_unreadable)
+        monkeypatch.setattr(type(log), "_read_metadata_status", _status)
+
+        outcome = await asyncio.wait_for(c._consolidate(KEY, include_history=True), 10)
+
+        assert outcome is _CONSOLIDATION_REFUSED
+        c._call_llm.assert_not_awaited()
+
+    def test_the_snapshot_is_ungated_unless_asked(self, tmp_path):
+        """Other callers keep the plain three-tuple; only the consolidator asks."""
+        log = _seed_log(tmp_path)
+        with history_mod.allow_on_loop_persist():
+            log.update_metadata(KEY, {"memory_mode": "incognito"})
+        rows, total, generation = log.snapshot_for_consolidation(KEY)
+        assert (len(rows), total) == (3, 3)
+        with pytest.raises(history_mod.ConsolidationWithheld):
+            log.snapshot_for_consolidation(KEY, withhold_restricted=True)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("version", "seed_source", "assistant_value"),

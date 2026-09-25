@@ -891,6 +891,44 @@ class TestSuggestionsContext:
         # is handed, so the read log is checked in that spelling.
         assert read_keys == ["dashboard_n1"], "the restricted transcript was read"
 
+    def test_build_context_drops_a_session_tightened_during_its_row_read(
+        self, tmp_path, monkeypatch
+    ):
+        """The listing row is a snapshot; the line is re-asked once the rows are read.
+
+        A same-key hand-over can land a restricted tab's rows under a line that
+        was persistent when ``list_sessions()`` ran. The rows just read must not
+        ground the prompt if the line now says restricted.
+        """
+        from kiro_crew import suggestions
+
+        monkeypatch.setattr(
+            suggestions.ContextBuilder,
+            "get_memory_for",
+            MagicMock(side_effect=RuntimeError("no memory in this test")),
+        )
+        log = ConversationLog(base_dir=tmp_path)
+        _write_session(log, "dashboard:t1", [("user", "SECRET landed late")])
+        _write_session(log, "dashboard:n1", [("user", "public refactor plan")])
+        real_recent = log.recent
+
+        def _recent_then_tighten(key, *args, **kwargs):
+            rows = real_recent(key, *args, **kwargs)
+            if key == "dashboard_t1":
+                log.update_metadata(key, {"memory_mode": "incognito"})
+            return rows
+
+        monkeypatch.setattr(log, "recent", _recent_then_tighten)
+        state = MagicMock(conversation_log=log)
+        state.crons.list_jobs.return_value = []
+
+        context = suggestions._build_context(state)
+
+        assert "public refactor plan" in context
+        assert (
+            "SECRET" not in context
+        ), "rows read under a line tightened mid-read reached the prompt"
+
 
 # ── Soft gate: incognito prompt prefix (chat.py) ──
 

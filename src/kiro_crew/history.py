@@ -817,11 +817,47 @@ def is_incognito_transcript(memory_mode: object) -> bool:
     return str(memory_mode or "").lower() in INCOGNITO_MEMORY_MODES
 
 
+class ConsolidationWithheld(RuntimeError):
+    """A consolidation snapshot met a restricted (or unreadable) line under its lock.
+
+    Raised by :meth:`ConversationLog.snapshot_for_consolidation` with
+    ``withhold_restricted=True``; the consolidator treats it as a refusal -- no
+    model turn, no memory write, no failure charge -- because there is nothing
+    wrong with the session, it is simply one nothing may be learned from.
+    """
+
+
+def transcript_withholds_derivation(log: "ConversationLog", key: str) -> bool:
+    """True when *key*'s ON-DISK line forbids deriving anything from the transcript.
+
+    The metadata line's ``memory_mode`` is the file's privacy contract: every
+    reader that learns from the file gates on it, and any writer -- this process,
+    another gateway on the same data home, a subagent or cron appending to the
+    session -- may only ever tighten it. A reader that reads the ROWS from disk
+    but gates on a LIVE slot's mode (the session summary, the export) can
+    therefore lag the file: the line says restricted, the slot it kept in memory
+    still says persistent, and the private rows go to a model or a file. Such a
+    reader asks this predicate about the file it is about to read, and again
+    about the file it just read, so a tightening that lands between the two is
+    caught as well.
+
+    Fails CLOSED: a line that cannot be read answers ``True``, because a reader
+    that cannot see the contract has no business acting on the rows. An absent
+    file (no line yet) is not a refusal -- there is nothing on disk to protect.
+    """
+    metadata, readable = log.get_metadata_status(key)
+    if not readable:
+        return True
+    return is_incognito_transcript(metadata.get("memory_mode"))
+
+
 # The fields that record where a message came from: the session key it arrived
 # on (``source_thread``, e.g. ``slack:1785861252.833429``) and the platform user
 # who sent it (``source_user``). Written by :meth:`ConversationLog.append`, read
 # by :meth:`ConversationLog.get_source_threads` for cross-session citation and
 # by SEL attribution.
+
+
 PROVENANCE_FIELDS = ("source_thread", "source_user")
 
 
@@ -2679,8 +2715,21 @@ class ConversationLog:
         """
         return int(self._read_metadata(key).get("rotation_generation", 0) or 0)
 
-    def snapshot_for_consolidation(self, key: str) -> tuple[list[dict], int, int]:
+    def snapshot_for_consolidation(
+        self, key: str, *, withhold_restricted: bool = False
+    ) -> tuple[list[dict], int, int]:
         """Atomically snapshot ``(unconsolidated_messages, total, generation)``.
+
+        With ``withhold_restricted=True`` the metadata line's ``memory_mode`` is
+        read under the SAME lock hold and validated with the rows: an incognito or
+        temporary line -- or one that cannot be read -- raises
+        :class:`ConsolidationWithheld` instead of returning rows. The
+        consolidator's own privacy check reads the line before this snapshot, and
+        a writer can tighten it in between (a same-key hand-over landing a
+        restricted tab's rows under a line that was persistent a moment ago);
+        rows and contract taken in one hold cannot disagree, so nothing the
+        consolidator sends to a model or writes to memory is ever rows a
+        restricted line already governed.
 
         The consolidator needs the unconsolidated tail, the total message count
         (the absolute offset it later passes to :meth:`mark_consolidated`), and
@@ -2702,7 +2751,13 @@ class ConversationLog:
         """
         with self._locked(key):
             messages = self._read_messages(key)
-            meta = self._read_metadata(key)
+            meta, readable = self._read_metadata_status(key)
+            if withhold_restricted and (
+                not readable or is_incognito_transcript(meta.get("memory_mode"))
+            ):
+                raise ConsolidationWithheld(
+                    "the transcript's line is restricted or unreadable; nothing is derived from it"
+                )
             offset = meta.get("last_consolidated", 0)
             generation = int(meta.get("rotation_generation", 0) or 0)
             return list(messages[offset:]), len(messages), generation

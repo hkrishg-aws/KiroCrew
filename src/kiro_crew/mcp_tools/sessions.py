@@ -22,7 +22,7 @@ from typing import Any
 
 from kiro_crew import mcp_core
 from kiro_crew.context import RECALL_ROLES
-from kiro_crew.history import ConversationLog
+from kiro_crew.history import ConversationLog, transcript_withholds_derivation
 from kiro_crew.validation import (
     GET_CHAT_SESSION_SCHEMA,
     LIST_SESSIONS_SCHEMA,
@@ -214,7 +214,14 @@ def search_chat_history(name: str, args: dict[str, Any]) -> str:
         if before_epoch is not None and modified >= before_epoch:
             continue
 
-        snippet = mcp_core._extract_history_snippet(cl.read_messages(key), query)
+        rows_for_snippet = cl.read_messages(key)
+        if transcript_withholds_derivation(cl, key):
+            # Re-asked AFTER the rows were read: the line checked above is a
+            # snapshot, and a writer can tighten it between that check and the
+            # read (a same-key hand-over landing private rows under a line that
+            # was persistent a moment ago). Fails closed on an unreadable line.
+            continue
+        snippet = mcp_core._extract_history_snippet(rows_for_snippet, query)
         results.append(
             {
                 "session_key": key,
@@ -339,6 +346,19 @@ def get_chat_session(name: str, args: dict[str, Any]) -> str:
     # recent() treats a falsy roles as "no filter" and would admit internal
     # rows here.
     messages = cl.recent(key, max_messages=max_messages, roles=RECALL_ROLES)
+    if transcript_withholds_derivation(cl, key):
+        # Re-asked AFTER the rows were read: the line checked above is a
+        # snapshot, and a writer can tighten it between that check and the read
+        # (a same-key hand-over landing private rows under a line that was
+        # persistent a moment ago). Same refusal as above; fails closed on an
+        # unreadable line.
+        mcp_core.sel().log_tool_invocation(
+            session_key=session_key,
+            source="mcp",
+            tool_name="get_chat_session",
+            outcome="refused_incognito",
+        )
+        return "That conversation is private (incognito/temporary) and cannot be read."
     if not messages:
         mcp_core.sel().log_tool_invocation(
             session_key=session_key,

@@ -39,6 +39,7 @@ from kiro_crew.dashboard.handlers._shared import (
 from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
 from kiro_crew.dashboard.session_transfer import (
     SnapshotUnstable,
+    TranscriptWithheld,
     build_transfer_bundle_async,
     local_instance_label,
 )
@@ -1070,6 +1071,21 @@ async def api_instances_send_session(request: web.Request) -> web.Response:
     # every unsaved turn twice in the copy.
     try:
         bundle = await build_transfer_bundle_async(state, slot, origin=local_instance_label())
+    except TranscriptWithheld as exc:
+        # The bundle is built from the transcript on DISK, and the file's own
+        # privacy contract gates it, not only the live slot's mode checked above:
+        # a same-key persistent recreation of a closed restricted tab, or another
+        # writer tightening the line while this slot still reads persistent in
+        # memory. The builder checks the line before and after its read; nothing
+        # was sent. Same refusal as the slot gate, because it is the same fact.
+        _audit("send_session", "denied", request_id=instance_id, error=f"on-disk line: {exc}")
+        return web.json_response(
+            {
+                "error": "cannot transfer a non-persistent session",
+                "code": "transfer_slot_not_persistent",
+            },
+            status=400,
+        )
     except SnapshotUnstable:
         # No consistent view of the source: either a flush landed inside every
         # retry, or a rewind/regenerate rewrite is still owed so disk is stale.

@@ -526,19 +526,28 @@ def read_session_execution(session_key: str, *, required: bool = False) -> Execu
     if not readable:
         raise _unavailable("session record is unreadable")
     execution = execution_from_record(record, required=required)
-    if execution is None:
-        if record.get("member_id") or record.get("selection_kind") == "member":
-            raise _missing_identity(_OPEN_A_NEW_CHAT_REMEDY)
-        store = record.get("memory_store")
-        if store and store != "default":
-            from kiro_crew.memory_stores import memory_store_version
+    if execution is not None:
+        # The line's own ``memory_mode`` is the file's privacy contract and a
+        # ratchet every writer folds; the record carried beside it holds a mode
+        # of its own and can lag a tightening of the line (a hand-edited
+        # ``Incognito`` header on a member chat, a line ratcheted by a save that
+        # could not also rewrite the record). A reader that answers from the
+        # record alone would hand back the looser mode, so the line is folded in
+        # here, at the one seam every carrier-first reader and every binder goes
+        # through. ``with_mode`` only ever tightens.
+        return execution.with_mode(canonical_memory_mode(record.get("memory_mode")))
+    if record.get("member_id") or record.get("selection_kind") == "member":
+        raise _missing_identity(_OPEN_A_NEW_CHAT_REMEDY)
+    store = record.get("memory_store")
+    if store and store != "default":
+        from kiro_crew.memory_stores import memory_store_version
 
-            if memory_store_version(store) == 2:
-                backfilled = _backfill_legacy_member_record(session_key, record, store)
-                if backfilled is not None:
-                    return backfilled
-                raise _missing_identity(_legacy_store_remedy(store))
-    return execution
+        if memory_store_version(store) == 2:
+            backfilled = _backfill_legacy_member_record(session_key, record, store)
+            if backfilled is not None:
+                return backfilled
+            raise _missing_identity(_legacy_store_remedy(store))
+    return None
 
 
 _OPEN_A_NEW_CHAT_REMEDY = (

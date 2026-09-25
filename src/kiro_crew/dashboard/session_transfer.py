@@ -115,6 +115,7 @@ from kiro_crew.dashboard.chat_utils import (
 )
 from kiro_crew.dashboard.state import MAX_LIVE_SLOTS, DashboardState, _ChatSlot
 from kiro_crew.dashboard.token_auth import effective_request_app
+from kiro_crew.history import transcript_withholds_derivation
 from kiro_crew.security import (
     redact_credentials,
     redact_exfiltration_urls,
@@ -267,15 +268,42 @@ def local_instance_label() -> str:
         return "another instance"
 
 
+class TranscriptWithheld(RuntimeError):
+    """The transcript's ON-DISK line forbids deriving a bundle from it.
+
+    Raised by :func:`_read_chained_history` -- the one read every bundle takes its
+    rows from -- when the metadata line says the session is incognito or
+    temporary, or cannot be read at all. The callers (the file export, the tunnel
+    send) each already refuse a slot whose LIVE ``memory_mode`` is restricted;
+    this is the same refusal for the file, because a live slot can lag its file:
+    a same-key persistent recreation of a closed restricted tab, or another
+    writer (a second gateway on this data home, a hand-over drain, a subagent
+    or cron appending) tightening the line while the slot still reads persistent
+    in memory. Checked before the read and again after it, so a tightening that
+    lands in between is caught too. Nothing has been sent or written when this is
+    raised; the source is untouched.
+    """
+
+
 def _read_chained_history(state: DashboardState, session_key: str) -> list[dict]:
     """Read a session's full on-disk transcript. **Blocking** — file IO + JSON.
 
     Split out so a caller on the event loop can push it to a thread; see
     :func:`build_transfer_bundle_async`.
+
+    Gated on the file's own privacy contract before AND after the read (see
+    :class:`TranscriptWithheld`): the rows come from disk, so the line on disk --
+    not only the live slot the caller checked -- decides whether they may leave.
     """
-    if state.conversation_log:
-        return state.conversation_log.read_messages_chained(session_key)
-    return []
+    log = state.conversation_log
+    if not log:
+        return []
+    if transcript_withholds_derivation(log, session_key):
+        raise TranscriptWithheld("the on-disk transcript is restricted or unreadable")
+    history = log.read_messages_chained(session_key)
+    if transcript_withholds_derivation(log, session_key):
+        raise TranscriptWithheld("the on-disk transcript was tightened during the read")
+    return history
 
 
 def _events_jsonl_is_loadable(events: str) -> bool:
