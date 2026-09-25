@@ -7004,6 +7004,39 @@ class TestEmptyArgvElementDoesNotBreakTheDenyView:
         # interposed empty word is still not a publish.
         assert is_denied('git "" stash push') is None
 
+    def test_an_unquoted_expansion_before_the_subcommand_fails_closed(self):
+        """An unquoted expansion the shell removes before git starts
+        (``git ${UNSET} push``) must not stop the detector's subcommand seek,
+        or the floor is never consulted and the push runs."""
+        for cmd in (
+            "git $(echo '') push origin main",
+            "git ${UNSET} push origin main",
+            "git -c x=y ${UNSET} push origin main",
+            "git $UNSET push origin main",
+            "git `true` push origin main",
+            "git $(command true) push origin main",
+            'git `echo -n ""` push origin main',
+            "git $(true '(') push origin main",
+            "git $(echo ')' x) push origin main",
+            "git ${X:+ } push origin main",
+        ):
+            assert _argv_floor._is_git_push_via_normalizer(cmd.lower()) is True, cmd
+            assert is_denied(cmd) is not None, cmd
+        # The subcommand position still decides: these are not publishes.
+        for cmd in (
+            "git $X stash push",
+            "git $X status",
+            'git -C "$DIR" status',
+            "git $FLAGS log",
+            "git ${X} diff",
+            'git "$@" fetch',
+            "git ${EMPTY}status push origin feature",
+            'git $(echo "")status push origin feature',
+            "git $(command true) status",
+        ):
+            assert _argv_floor._is_git_push_via_normalizer(cmd.lower()) is False, cmd
+            assert is_denied(cmd) is None, cmd
+
     def test_a_whitespace_only_word_is_a_documented_residual(self):
         """DOCUMENTED GAP, pinned rather than claimed.
 

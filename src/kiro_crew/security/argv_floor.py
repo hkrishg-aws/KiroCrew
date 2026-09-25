@@ -89,8 +89,10 @@ from .shell_normalizer import (
     _PYTHON_PROGRAM_RE,
     _REDIRECT_START_RE,
     _SHELL_WRAPPER_CHARS,
+    _SUBSTITUTION_SHAPED_RE,
     _argv_programs,
     _backtick_closer,
+    _collapse_substitutions,
     _cut_at_operator,
     _data_consumer_exempt,
     _debracket,
@@ -3241,12 +3243,16 @@ def _is_git_push_via_normalizer(text_lower: str) -> bool:
                     j += 2  # skip flag + its argument
                 elif tokens[j].startswith("-"):
                     j += 1  # skip simple flag
+                elif _SUBSTITUTION_SHAPED_RE.fullmatch(tokens[j]):
+                    j += 1  # may expand to nothing: fail closed, keep seeking
                 else:
                     break
             if j < len(tokens) and _resolves_to(tokens[j], "push"):
                 return True
         i += 1
-    return False
+    # A multiword or quoted substitution body is re-read as the single word it expands to.
+    collapsed = _collapse_substitutions(text_lower)
+    return collapsed != text_lower and _is_git_push_via_normalizer(collapsed)
 
 
 _PROTECTED_BRANCHES = {"main", "mainline", "master"}  # wokeignore:rule=master

@@ -2577,6 +2577,31 @@ def _cut_at_operator(token: str) -> str:
     return "".join(out)
 
 
+# A whole word that may expand to nothing, once spans are collapsed to ``$()``.
+_SUBSTITUTION_SHAPED_RE = re.compile(r"\$(?:\w+|[@*#?!$-]|\(\))")
+
+
+def _collapse_substitutions(text: str) -> str:
+    """*text* with each ``$( )``, ``${ }`` and backtick span replaced by the one word
+    ``$()``, closers found quote-aware; an unclosed span swallows the rest."""
+    out: list[str] = []
+    i = 0
+    while i < len(text):
+        if text.startswith("$(", i):
+            i = _matching_close_paren(text, i + 2)[0]
+        elif text.startswith("${", i):
+            walk = _iter_shell_chars(text[i + 2 :])
+            i = next((i + 3 + c.offset for c in walk if c.active and c.char == "}"), len(text))
+        elif text[i] == "`":
+            i = _matching_close_backtick(text, i + 1)[0]
+        else:
+            out.append(text[i])
+            i += 1
+            continue
+        out.append("$()")
+    return "".join(out)
+
+
 class _ShellWalk(NamedTuple):
     """What one pass of the shell's quote/escape state machine observed."""
 
