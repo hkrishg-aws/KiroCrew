@@ -115,8 +115,29 @@ export function sanitizeCredentials(text: string): string {
   return out
 }
 
-// ── Exfiltration URL detection (matches redact_exfiltration_urls in security.py) ──
-const URL_RE = /https?:\/\/([a-zA-Z0-9._-]+\.[a-zA-Z]{2,})(:\d+)?(\/[^\s)"'>]*)?/g
+// ── Exfiltration URL detection (mirrors redact_exfiltration_urls in security.py) ──
+// Unlike the backend, the path runs past `)` (#8638), stopping only where a `)` opens a new URL.
+// Each URL is then cut back to where the renderer ends its link (see linkTarget/trimWrapperParen).
+const URL_RE = /https?:\/\/([a-zA-Z0-9._-]+\.[a-zA-Z]{2,})(:\d+)?(\/(?:[^\s)"'>]|\)(?!\]?\(?https?:\/\/))*)?/g
+// Drop trailing `)` that have no `(` partner in the URL, plus punctuation after them.
+function trimWrapperParen(url: string): string {
+  let extra = url.split(')').length - url.split('(').length
+  let keep = url.length
+  for (let i = url.length - 1; i >= 0 && extra > 0; i--) {
+    if (url[i] === ')') { extra--; keep = i } else if (!'.,;:!?'.includes(url[i])) break
+  }
+  return url.slice(0, keep)
+}
+
+// A markdown `](...)` target ends at its first `)` with no `(` partner, as CommonMark does.
+function linkTarget(url: string): string {
+  let depth = 0
+  for (let i = 0; i < url.length; i++) {
+    if (url[i] === '(') depth++
+    else if (url[i] === ')' && --depth < 0) return url.slice(0, i)
+  }
+  return url
+}
 const EXFIL_QUERY_MIN_LEN = 200
 
 // PATTERN signals: each names a shape rather than a size, and each runs for
@@ -180,9 +201,14 @@ const EXFIL_B64_RE = /[A-Za-z0-9+/=]{40,}/i
 export function sanitizeExfiltrationUrls(text: string): string {
   let out = text
   URL_RE.lastIndex = 0
-  for (const m of text.matchAll(URL_RE)) {
+  let m: RegExpExecArray | null
+  while ((m = URL_RE.exec(text))) {
     const domain = m[1]
-    const pathAndQuery = m[3] || ''
+    const inLink = text.slice(m.index - 2, m.index) === ']('
+    const url = inLink ? linkTarget(m[0]) : trimWrapperParen(m[0])
+    // Resume right after the URL, so text a link target left behind is matched on its own.
+    URL_RE.lastIndex = m.index + url.length
+    const pathAndQuery = url.slice(m[0].length - (m[3] || '').length)
     const qmark = pathAndQuery.indexOf('?')
     if (qmark === -1) continue
     const query = pathAndQuery.slice(qmark + 1)
@@ -192,7 +218,7 @@ export function sanitizeExfiltrationUrls(text: string): string {
       EXFIL_B64_RE.test(query) ||
       query.length >= EXFIL_QUERY_MIN_LEN
     if (redact) {
-      out = out.replace(m[0], i18nT('utils.sanitize.redacted_suspicious_url', { domain }))
+      out = out.replace(url, i18nT('utils.sanitize.redacted_suspicious_url', { domain }))
     }
   }
   return out
