@@ -7,7 +7,7 @@
  * target: resolving the origin here and the port somewhere else would let a
  * caller authenticate for one listener while dialing another.
  *
- * `URL.port` is "" on a scheme-default port, so the default is spelled out —
+ * `URL.port` is "" on a scheme-default port, so the default is spelled out:
  * an empty port would name a credential file no gateway ever wrote.
  *
  * @param {string} backendUrl
@@ -35,22 +35,49 @@ function literalLoopbackUrl(backendUrl) {
 }
 
 /**
- * Path of the gateway credential paired with the listener on `port`.
+ * Bind addresses whose listener necessarily answers the dialed v4 loopback.
  *
- * A gateway publishes its own in-memory credential as
- * `run/gateway-<port>.secret` once it has bound that port, mode 0600 inside an
- * owner-only `run/` directory. Reading that file answers "may a secret go to
- * whatever answers this port?" out of local disk state, so nothing is asked of
- * the peer: a process that merely holds the port, whatever it presents itself
- * as, is never consulted and never believed.
+ * The dialed address is always `127.0.0.1` -- `loopbackTarget` accepts nothing
+ * else -- so these are the only two spellings under which a published credential
+ * can belong to the party actually reached. A v4 loopback bind IS that party; a
+ * v4 wildcard bind covers it.
+ *
+ * Every other address is refused, `::` and `::1` included: a v6 bind leaves IPv4
+ * `127.0.0.1:<port>` unbound and free for a co-resident to take, so its
+ * credential belongs to a listener this call never spoke to. Whether a v6
+ * wildcard also accepts v4-mapped connections depends on the host's
+ * `IPV6_V6ONLY` setting, which is not a fact this side can establish, so it is
+ * treated as a different listener. The same family reasoning governs the
+ * gateway's own callback-host export.
+ *
+ * Trying both is NOT a fallback between listeners: each names a listener on the
+ * address being dialed, so neither can resolve to a party that was not reached.
+ */
+const LOOPBACK_COVERING_BINDS = ["127.0.0.1", "0.0.0.0"];
+
+/**
+ * Path of the gateway credential for the listener at `bindAddress` on `port`.
+ *
+ * A gateway publishes its own in-memory credential, once it has bound, as
+ * `run/gateway-<port>-<address>.secret`: mode 0600 inside an owner-only `run/`
+ * directory. Reading that file answers "may a secret go to whatever answers this
+ * address and port?" out of local disk state, so nothing is asked of the peer --
+ * a process that merely holds the port, whatever it presents itself as, is never
+ * consulted and never believed.
+ *
+ * The name carries the address because a port number identifies a SET of
+ * listeners. Keyed by port alone, a gateway bound to the v6 loopback and a
+ * tunnel's local end on v4 share one entry, and the app would read the former's
+ * credential and send it to the latter.
  *
  * @param {string} home data home whose `config.json` governs this launch
  * @param {string} port port being dialed
+ * @param {string} bindAddress address whose listener published the credential
  * @param {object} path node:path (injected)
  * @returns {string}
  */
-function listenerSecretPath(home, port, path) {
-  return path.join(home, "run", `gateway-${port}.secret`);
+function listenerSecretPath(home, port, bindAddress, path) {
+  return path.join(home, "run", `gateway-${port}-${bindAddress}.secret`);
 }
 
 async function requestLocalToken(http, literalUrl, secret) {
@@ -79,35 +106,56 @@ async function requestLocalToken(http, literalUrl, secret) {
 }
 
 /**
- * A dashboard token minted against the gateway that owns the dialed port.
+ * A dashboard token minted against the gateway that owns the dialed listener.
  *
  * The credential sent is the one that gateway published for its own listener,
- * and the home-wide `.local_secret` is deliberately not a second place to look.
- * That file holds one slot per data home on a last-writer-wins basis, so its
- * value can belong to a gateway on a DIFFERENT port; sending it to whoever
- * answers this port would surrender a credential that authenticates elsewhere.
- * A listener-scoped credential cannot escalate, because the only listener it
- * authenticates against is the one it was just sent to.
+ * identified by the address AND the port that were dialed. Neither the home-wide
+ * `.local_secret` nor a port-keyed entry is a second place to look. The shared
+ * file holds one slot per data home on a last-writer-wins basis, and a port-keyed
+ * entry names every listener sharing that port number, so either can hold a
+ * credential belonging to a gateway this call never reached. Sending that to
+ * whoever answers here would surrender a credential which authenticates
+ * elsewhere. An entry keyed by the dialed listener cannot escalate, because the
+ * only listener it authenticates against is the one it was just sent to.
  *
- * An absent file therefore denies rather than widens: a port no local gateway
- * bound — an `ssh -L` forward's local end among them — has no credential to
- * read, so the caller falls through to the remote-token path and then to the
- * token prompt.
+ * An absent entry therefore denies rather than widens. A port no local gateway
+ * bound on this address, an `ssh -L` forward's local end among them, whether or
+ * not a v6-bound gateway holds the same port number, has no credential to read,
+ * so the caller falls through to the remote-token path and then to the token
+ * prompt.
+ *
+ * A REFUSED entry is not the end of the walk either. `clear_marker` runs only on
+ * a graceful shutdown, so a crashed gateway leaves its entry behind, and a stale
+ * exact-address entry sitting beside the live wildcard one would otherwise spend
+ * the single attempt and report no token while a working credential was never
+ * tried. Continuing costs nothing that matters: a dead generation's secret
+ * authenticates against no listener at all, and every candidate names a listener
+ * on the address being dialed, so the walk never reaches a party this call did
+ * not reach.
  */
 async function fetchLocalToken({ backendUrl, resolveHome, path, fs, http }) {
   const target = loopbackTarget(backendUrl);
   if (!target) return "";
-  let secret = "";
-  try {
-    const authoritativeHome = resolveHome();
-    secret = fs
-      .readFileSync(listenerSecretPath(authoritativeHome, target.port, path), "utf8")
-      .trim();
-  } catch {
-    // A missing/unreadable listener credential is an ordinary token miss.
+  const authoritativeHome = resolveHome();
+  for (const bindAddress of LOOPBACK_COVERING_BINDS) {
+    let secret = "";
+    try {
+      secret = fs
+        .readFileSync(listenerSecretPath(authoritativeHome, target.port, bindAddress, path), "utf8")
+        .trim();
+    } catch {
+      // A missing/unreadable entry is an ordinary token miss.
+    }
+    if (!secret) continue;
+    const token = await requestLocalToken(http, target.origin, secret);
+    if (token) return token;
   }
-  if (!secret) return "";
-  return requestLocalToken(http, target.origin, secret);
+  return "";
 }
 
-module.exports = { fetchLocalToken, literalLoopbackUrl, listenerSecretPath };
+module.exports = {
+  fetchLocalToken,
+  literalLoopbackUrl,
+  listenerSecretPath,
+  LOOPBACK_COVERING_BINDS,
+};
