@@ -77,7 +77,9 @@ from kiro_crew.security import (
     enabled_rule_ids,
     is_sensitive_bash_command,
     is_sensitive_path,
+    is_unverifiable_path_refusal,
     scan_exfiltration_urls,
+    sensitive_path_refusal,
 )
 from kiro_crew.sel import sel
 from kiro_crew.validation import (
@@ -892,7 +894,9 @@ def _vet_script_file(file_path: str) -> str | None:
         resolved = Path(file_path).resolve()
     except (OSError, ValueError) as e:
         return f"Error: cannot resolve cron script path for security review: {e}"
-    if is_sensitive_path(str(resolved)):
+    if reason := sensitive_path_refusal(str(resolved)):
+        if is_unverifiable_path_refusal(reason):
+            return f"Error: {reason}"
         return "Error: cron script path blocked by security policy (resolves to a sensitive credential path)"
     try:
         before = os.lstat(resolved)

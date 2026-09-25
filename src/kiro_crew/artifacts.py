@@ -76,7 +76,13 @@ from kiro_crew.deploy.webapp_types import (  # noqa: F401 — re-export for API 
 )
 from kiro_crew.metrics.events import ARTIFACTS_CREATED, emit_counter
 from kiro_crew.publish_provider import DEFAULT_PROVIDER
-from kiro_crew.security import is_sensitive_canonical_path, is_sensitive_path
+from kiro_crew.security import (
+    canonical_path_refusal,
+    is_sensitive_canonical_path,
+    is_sensitive_path,
+    is_unverifiable_path_refusal,
+    sensitive_path_refusal,
+)
 from kiro_crew.slugs import slug_hash_fallback
 
 logger = logging.getLogger(__name__)
@@ -1235,6 +1241,14 @@ def _fence_refuses(resolved: Path) -> bool:
     return is_sensitive_canonical_path(str(resolved))
 
 
+def _fence_refusal(resolved: Path, verb: str) -> str | None:
+    """:func:`_fence_refuses` with wording: a resolver stall is passed through as a stall."""
+    reason = canonical_path_refusal(str(resolved))
+    if reason and not is_unverifiable_path_refusal(reason):
+        return f"refusing to {verb} sensitive path: {resolved}"
+    return reason
+
+
 def _open_pinned_for_read(resolved: Path) -> int:
     """Open a store file for reading, pinned to the descriptor it returns.
 
@@ -1273,7 +1287,9 @@ class ArtifactStore:
         # Refuse to land under any sensitive path. is_sensitive_path() handles
         # symlink resolution, so resolve() before checking.
         resolved = self._root.resolve(strict=False)
-        if is_sensitive_path(str(resolved)):
+        if reason := sensitive_path_refusal(str(resolved)):
+            if is_unverifiable_path_refusal(reason):
+                raise ArtifactError(reason)
             raise ArtifactError(f"refusing to use sensitive path as artifact root: {resolved}")
         # Keyed by the RESOLVED root so a symlinked alias of the same
         # directory still shares the lock, not just a literal path match.
@@ -3753,8 +3769,8 @@ class ArtifactStore:
         redirect the read after that first decision.
         """
         resolved = Path(os.path.realpath(path))
-        if _fence_refuses(resolved):
-            raise ArtifactError(f"refusing to read sensitive path: {resolved}")
+        if reason := _fence_refusal(resolved, "read"):
+            raise ArtifactError(reason)
         fd = _open_pinned_for_read(resolved)
         with os.fdopen(fd, "r", encoding="utf-8") as fh:
             return fh.read()
@@ -3769,8 +3785,8 @@ class ArtifactStore:
         would change the decision rather than the submission path.
         """
         resolved = Path(os.path.realpath(path))
-        if _fence_refuses(resolved):
-            raise ArtifactError(f"refusing to write sensitive path: {resolved}")
+        if reason := _fence_refusal(resolved, "write"):
+            raise ArtifactError(reason)
         resolved.parent.mkdir(parents=True, exist_ok=True)
         # Atomic write: tmp file + rename.
         tmp = resolved.with_suffix(resolved.suffix + ".tmp")
@@ -3783,8 +3799,8 @@ class ArtifactStore:
         Same sensitive-path gate and the same descriptor checks as text reads.
         """
         resolved = Path(os.path.realpath(path))
-        if _fence_refuses(resolved):
-            raise ArtifactError(f"refusing to read sensitive path: {resolved}")
+        if reason := _fence_refusal(resolved, "read"):
+            raise ArtifactError(reason)
         fd = _open_pinned_for_read(resolved)
         with os.fdopen(fd, "rb") as fh:
             return fh.read()
@@ -3828,8 +3844,8 @@ class ArtifactStore:
         never observes a half-written asset.
         """
         resolved = Path(os.path.realpath(path))
-        if _fence_refuses(resolved):
-            raise ArtifactError(f"refusing to write sensitive path: {resolved}")
+        if reason := _fence_refusal(resolved, "write"):
+            raise ArtifactError(reason)
         resolved.parent.mkdir(parents=True, exist_ok=True)
         tmp = resolved.with_suffix(resolved.suffix + ".tmp")
         tmp.write_bytes(data)
