@@ -941,11 +941,16 @@ class OrphanStallMonitor(ManagerComponent):
                 # "failed to start" error instead of burning the full deadline
                 # and surfacing a misleading 30-minute turn-0 timeout.
                 if self._manager._is_startup_stalled(info, now):
+                    # The in-startup population is diagnostic only: the
+                    # deadline is the fixed ``_startup_deadline`` whatever the
+                    # crowd, measured from gate exit (``_gate_exit_reset``).
                     logger.warning(
                         "Reaper: subagent %s failed to start within %ds "
-                        "(turn 0, no runtime launched), force-killing",
+                        "(turn 0, no runtime launched; %d other agent(s) in startup), "
+                        "force-killing",
                         agent_id,
                         self._manager._startup_deadline,
+                        self._manager._startup_population(exclude=info),
                     )
                     try:
                         await self._manager._force_reap(
@@ -1002,6 +1007,16 @@ class OrphanStallMonitor(ManagerComponent):
         ``_exec_started`` — not the registration timestamp ``started`` — means
         an agent merely awaiting spawn approval (never entered ``_run_inner``)
         is never caught here.
+
+        The deadline is the fixed ``_startup_deadline`` however many other
+        agents are in startup: ``_exec_started`` is reset at ``SessionStartGate``
+        exit on both start paths (``_gate_exit_reset``), so the clock measures
+        time spent STARTING once a permit is held, not time queued behind other
+        starts, and the in-startup population is bounded separately by
+        ``_startup_cap`` at admission. A deadline that grew with the population
+        was tried and withdrawn: sampled at sweep time against a clock spanning
+        the whole crowded period, it shrank as the crowd drained and could reap
+        an agent that an earlier sweep had left inside its window.
         """
         exec_started = info._exec_started
         if exec_started is None:

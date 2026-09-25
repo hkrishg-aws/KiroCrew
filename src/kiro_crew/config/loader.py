@@ -5666,6 +5666,12 @@ class KiroCrewConfig:
             # the session would spawn on the backend's default with no error.
             permission_mode: str | None = None,
             shared_scratch: Path | None = None,
+            # The subagent manager's gate-exit start-clock reset for a DEDICATED
+            # subagent process. NAMED for the same reason ``permission_mode``
+            # is: swallowed by the catch-all, the dedicated path would silently
+            # keep charging session-start-gate queue time to the startup
+            # watchdog, which is the exact defect the callback exists to end.
+            on_gate_acquired: Callable[[float], None] | None = None,
             **_kwargs: object,
         ) -> AcpProvider:
             wdir = Path(cwd) if cwd else _session_work_dir(session_key)
@@ -5805,6 +5811,7 @@ class KiroCrewConfig:
                 # the tree's work directory is mounted beside its own scratch
                 # and is what its ``$KIROCREW_SCRATCH`` names (agent_scratch).
                 shared_scratch=shared_scratch,
+                on_gate_acquired=on_gate_acquired,
             )
 
         return _acp
