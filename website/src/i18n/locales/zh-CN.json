@@ -6523,6 +6523,7 @@
       "unknown_error": "导入失败"
     },
     "instanceTabBar": {
+      "chain_via": "{{via}} › {{name}}",
       "connected": "已连接",
       "connected_refresh": "已连接 · {{time}} 后刷新",
       "connected_refreshing": "已连接 · 刷新中…",

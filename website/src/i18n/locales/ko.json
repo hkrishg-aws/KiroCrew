@@ -6523,6 +6523,7 @@
       "unknown_error": "가져오기에 실패했습니다"
     },
     "instanceTabBar": {
+      "chain_via": "{{via}} › {{name}}",
       "connected": "연결됨",
       "connected_refresh": "연결됨 · 갱신 {{time}}",
       "connected_refreshing": "연결됨 · 갱신 중…",

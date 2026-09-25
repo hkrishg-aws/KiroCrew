@@ -6628,6 +6628,7 @@
       "unknown_error": "ইমপোর্ট ব্যর্থ হয়েছে"
     },
     "instanceTabBar": {
+      "chain_via": "{{via}} › {{name}}",
       "connected": "সংযুক্ত",
       "connected_refresh": "সংযুক্ত · রিফ্রেশ {{time}}",
       "connected_refreshing": "সংযুক্ত · রিফ্রেশ হচ্ছে…",

@@ -6523,6 +6523,7 @@
       "unknown_error": "インポートに失敗しました"
     },
     "instanceTabBar": {
+      "chain_via": "{{via}} › {{name}}",
       "connected": "接続済み",
       "connected_refresh": "接続済み · {{time}} に更新",
       "connected_refreshing": "接続済み · 更新中…",

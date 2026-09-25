@@ -6628,6 +6628,7 @@
       "unknown_error": "Der Import ist fehlgeschlagen"
     },
     "instanceTabBar": {
+      "chain_via": "{{via}} › {{name}}",
       "connected": "verbunden",
       "connected_refresh": "verbunden · Aktualisierung {{time}}",
       "connected_refreshing": "verbunden · wird aktualisiert…",

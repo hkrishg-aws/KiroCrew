@@ -6733,6 +6733,7 @@
       "unknown_error": "A importação falhou"
     },
     "instanceTabBar": {
+      "chain_via": "{{via}} › {{name}}",
       "connected": "conectado",
       "connected_refresh": "conectado · atualização {{time}}",
       "connected_refreshing": "conectado · atualizando…",

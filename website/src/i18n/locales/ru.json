@@ -6838,6 +6838,7 @@
       "unknown_error": "Не удалось выполнить импорт"
     },
     "instanceTabBar": {
+      "chain_via": "{{via}} › {{name}}",
       "connected": "подключено",
       "connected_refresh": "подключено · обновление {{time}}",
       "connected_refreshing": "подключено · обновление…",

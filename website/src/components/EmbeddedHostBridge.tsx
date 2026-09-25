@@ -55,6 +55,17 @@ function parseHostModel(data: unknown): HostModel | null {
       sshHost: String(t.sshHost ?? ''),
       state: typeof t.state === 'string' ? t.state : undefined,
       unread: Number(t.unread) || 0,
+      // Element-wise, like every other field here: a malformed depth must degrade
+      // to "no indent" rather than putting a non-number into the row's padding.
+      // `undefined` is also what an older host sends (no field at all), and the
+      // bar reads that as the flat list it always rendered.
+      depth: typeof t.depth === 'number' && Number.isFinite(t.depth) && t.depth >= 0
+        ? Math.floor(t.depth)
+        : undefined,
+      // Only an explicit `false` greys a row out. Absence must not: an older host
+      // sends no field, and reading that as unreachable would grey out every crew.
+      reachable: typeof t.reachable === 'boolean' ? t.reachable : undefined,
+      pathName: typeof t.pathName === 'string' ? t.pathName : undefined,
     }))
     .filter(t => t.id)
   const rawSelf = d.self && typeof d.self === 'object' ? (d.self as Record<string, unknown>) : null

@@ -6628,6 +6628,7 @@
       "unknown_error": "इंपोर्ट विफल रहा"
     },
     "instanceTabBar": {
+      "chain_via": "{{via}} › {{name}}",
       "connected": "कनेक्टेड",
       "connected_refresh": "कनेक्ट है · रिफ़्रेश {{time}}",
       "connected_refreshing": "कनेक्टेड · रिफ़्रेश हो रहा है…",
