@@ -737,14 +737,106 @@ class TestLogsCmdSystemd:
         log.write_text("hi\n", encoding="utf-8", newline="\n")
         monkeypatch.setattr(cli_server, "config_dir", lambda: tmp_path)
 
-        def unreachable(*a, **k):  # pragma: no cover - proves no journal probe
-            raise AssertionError("journalctl must not be probed without an installed unit")
+        def only_the_user_scope_query(argv, *a, **k):
+            # No system unit: the one spawn allowed is the user-scope
+            # `systemctl --user show` that asks whether THAT scope has the unit
+            # (answer: no). journalctl must not be probed without an installed
+            # unit in either scope.
+            if list(argv)[:3] == ["systemctl", "--user", "show"]:
+                return subprocess.CompletedProcess(argv, 0, "LoadState=not-found\n", "")
+            raise AssertionError(f"unexpected spawn without an installed unit: {argv}")
 
-        monkeypatch.setattr(subprocess, "run", unreachable)
+        monkeypatch.setattr(subprocess, "run", only_the_user_scope_query)
         with pytest.raises(_ExecCalled) as exc:
             cli_server._logs_cmd(argparse.Namespace(follow=False, lines=3))
         assert exc.value.file == "tail"
         assert exc.value.argv == ["tail", "-n", "3", str(log)]
+
+
+class TestLogsCmdUserScope:
+    """A gateway running as the per-user unit (the SELinux remedy) has its logs in
+    the USER journal, which `journalctl --user` reads without privilege."""
+
+    @pytest.fixture(autouse=True)
+    def _user_unit_only(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(cli_server, "current_platform", lambda: Platform.SYSTEMD)
+        monkeypatch.setattr(svc_linux, "UNIT_PATH", tmp_path / "absent.service")
+        monkeypatch.setattr(svc_linux, "user_unit_installed", lambda: True)
+
+    def test_user_journal_is_execed_when_only_the_user_unit_exists(
+        self, monkeypatch, sel_rec, fake_execvp
+    ) -> None:
+        probes: list[list[str]] = []
+
+        def probe(argv, *a, **k):
+            probes.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, "-- Logs begin --\n", "")
+
+        monkeypatch.setattr(subprocess, "run", probe)
+        with pytest.raises(_ExecCalled) as exc:
+            cli_server._logs_cmd(argparse.Namespace(follow=True, lines=42))
+        assert exc.value.file == "journalctl"
+        assert exc.value.argv[:2] == ["journalctl", "--user"]
+        assert "-u" in exc.value.argv and "kirocrew.service" in exc.value.argv
+        assert "42" in exc.value.argv
+        assert exc.value.argv[-1] == "-f"
+        assert probes == [
+            ["journalctl", "--user", "-u", "kirocrew.service", "-n", "1", "--no-pager"]
+        ]
+        assert sel_rec.operations == ["logs"]
+
+    def test_an_empty_user_journal_falls_through_to_the_log_file_without_sudo(
+        self, monkeypatch, tmp_path, sel_rec, fake_execvp
+    ) -> None:
+        # The user journal never needs sudo, so an empty probe is not a
+        # permission problem to escalate past: the file is the next source.
+        log = tmp_path / "gateway.log"
+        log.write_text("hi\n", encoding="utf-8", newline="\n")
+        monkeypatch.setattr(cli_server, "config_dir", lambda: tmp_path)
+        monkeypatch.setattr(
+            subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a[0], 1, "", "")
+        )
+        monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+        with pytest.raises(_ExecCalled) as exc:
+            cli_server._logs_cmd(argparse.Namespace(follow=False, lines=3))
+        assert exc.value.file == "tail"
+        assert exc.value.argv == ["tail", "-n", "3", str(log)]
+
+    def test_a_running_user_unit_wins_over_a_leftover_system_unit_file(
+        self, monkeypatch, tmp_path, sel_rec, fake_execvp
+    ) -> None:
+        """Both scopes have a unit (a stopped system unit from an earlier install,
+        the gateway running as the user unit): the journal shown is the running
+        unit's, not the dead one's."""
+        unit = tmp_path / "kirocrew.service"
+        unit.write_text("[Unit]\n", encoding="utf-8", newline="\n")
+        monkeypatch.setattr(svc_linux, "UNIT_PATH", unit)
+        monkeypatch.setattr(svc_linux, "user_unit_active", lambda: True)
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *a, **k: subprocess.CompletedProcess(a[0], 0, "-- Logs begin --\n", ""),
+        )
+        with pytest.raises(_ExecCalled) as exc:
+            cli_server._logs_cmd(argparse.Namespace(follow=False, lines=7))
+        assert exc.value.argv[:2] == ["journalctl", "--user"]
+
+    def test_an_inactive_user_unit_leaves_the_system_journal_first(
+        self, monkeypatch, tmp_path, sel_rec, fake_execvp
+    ) -> None:
+        unit = tmp_path / "kirocrew.service"
+        unit.write_text("[Unit]\n", encoding="utf-8", newline="\n")
+        monkeypatch.setattr(svc_linux, "UNIT_PATH", unit)
+        monkeypatch.setattr(svc_linux, "user_unit_active", lambda: False)
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *a, **k: subprocess.CompletedProcess(a[0], 0, "-- Logs begin --\n", ""),
+        )
+        with pytest.raises(_ExecCalled) as exc:
+            cli_server._logs_cmd(argparse.Namespace(follow=False, lines=7))
+        assert exc.value.argv[0] == "journalctl"
+        assert "--user" not in exc.value.argv
 
 
 class TestLogsCmdOtherSources:

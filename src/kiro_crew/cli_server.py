@@ -2698,9 +2698,11 @@ def _logs_cmd(args: argparse.Namespace) -> None:
     """Tail gateway logs from the most appropriate source.
 
     Order of preference:
-      1. systemd journal (if the system service is installed on Linux)
-      2. launchd stdout file (macOS)
-      3. ``~/.kiro/crew/gateway.log`` (foreground gateway)
+      1. the USER journal (``journalctl --user``) when the per-user unit — the
+         SELinux remedy's gateway — is the one running, or the only one installed
+      2. systemd journal (if the system service is installed on Linux)
+      3. launchd stdout file (macOS)
+      4. ``~/.kiro/crew/gateway.log`` (foreground gateway)
     """
     follow = bool(getattr(args, "follow", False))
     lines = int(getattr(args, "lines", 100) or 100)
@@ -2717,7 +2719,32 @@ def _logs_cmd(args: argparse.Namespace) -> None:
         resources=f"follow={follow} lines={lines} platform={plat.value}",
     )
 
-    if plat == Platform.SYSTEMD and svc_linux.UNIT_PATH.exists():
+    system_unit = plat == Platform.SYSTEMD and svc_linux.UNIT_PATH.exists()
+    user_unit = plat == Platform.SYSTEMD and svc_linux.user_unit_installed()
+    # A gateway running as the per-user unit (what the SELinux refusal hands the
+    # operator) logs to the account's OWN journal, which the system-scope arm
+    # below never opens — and that arm always execs or exits once the system unit
+    # file exists, so on a host where a stopped system unit was left beside the
+    # running user unit it would tail the dead unit's journal. The user journal
+    # therefore goes first whenever its unit is the running one (or the only
+    # one). `journalctl --user` reads it without privilege, so there is no sudo
+    # rung here: an empty probe means the user journal holds nothing readable
+    # (no persistent journal, or none for this unit yet), and the next source is
+    # the honest fallback rather than a password prompt.
+    if user_unit and (not system_unit or svc_linux.user_unit_active()):
+        base = ["journalctl", "--user", "--no-pager", "-u", unit, "-n", str(lines)]
+        probe = subprocess.run(
+            ["journalctl", "--user", "-u", unit, "-n", "1", "--no-pager"],
+            capture_output=True,
+            check=False,
+            **UTF8_TEXT,
+        )
+        if probe.returncode == 0 and probe.stdout.strip():
+            if follow:
+                base.append("-f")
+            os.execvp("journalctl", base)
+
+    if system_unit:
         # Try journalctl unprivileged first — it works if the user is in
         # the `systemd-journal` or `adm` group. Only fall back to sudo
         # journalctl if the unprivileged probe returns no rows. Without

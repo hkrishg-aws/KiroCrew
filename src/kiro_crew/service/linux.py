@@ -19,10 +19,14 @@ atomic desktops). PID 1's domain is denied ``execute`` on a home-labelled file,
 so the unit fails every start with ``203/EXEC``. :mod:`kiro_crew.service
 .selinux` detects exactly that case by querying the loaded policy, and
 :func:`install` refuses up front with a rendered user-scope unit as the remedy
-rather than writing a unit that provably cannot start. A per-user install mode is
-the real fix and is deliberately NOT implemented here — it is an install-model
-change (scope-aware status/restart/uninstall, where the AppArmor profile and the
-root-owned overrides file live) rather than a mechanical one.
+rather than writing a unit that provably cannot start. A per-user INSTALL mode
+is deliberately NOT implemented here — it is an install-model change (where the
+AppArmor profile and the root-owned overrides file live) rather than a
+mechanical one. The unit that remedy stands up is nevertheless first-class to
+every other verb: :func:`status`, :func:`is_active`, :func:`stop`,
+:func:`restart` and :func:`uninstall` look at BOTH scopes and name the one they
+report on, because a health command that sees only the system unit reports a
+running user-scope gateway as ``inactive (dead)``.
 
 Sudo scope: this file escalates ``systemctl``, ``install``, ``mkdir``,
 ``rm``, ``rmdir`` and ``test`` directly, and lends its privileged helpers
@@ -68,6 +72,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 from kiro_crew.gateway_shutdown_budget import TOTAL_SHUTDOWN_BUDGET_SECS
@@ -78,6 +83,7 @@ from kiro_crew.service.common import (
     service_environment,
 )
 from kiro_crew.service.common import systemd_quote as _sd_quote
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 log = logging.getLogger(__name__)
 
@@ -398,11 +404,160 @@ def _sudo_run(
         )
 
 
-def _systemctl(*args: str, sudo: bool = True) -> subprocess.CompletedProcess[str]:
+def _systemctl(
+    *args: str, sudo: bool = True, user: bool = False
+) -> subprocess.CompletedProcess[str]:
+    """Run ``systemctl`` against one scope: the system manager, or with
+    ``user=True`` the calling account's own manager (``systemctl --user``).
+
+    A user-scope call never goes through sudo, whatever ``sudo`` says: under
+    ``sudo`` the process is root, and ``systemctl --user`` there addresses ROOT's
+    manager, not the account whose unit this module cares about. Callers gate on
+    :func:`_user_scope_unreachable_reason` before spawning for exactly that case.
+    """
+    if user:
+        return subprocess.run(
+            ["systemctl", "--user", *args], capture_output=True, check=False, **UTF8_TEXT
+        )
     if sudo:
         return _sudo_run("systemctl", *args)
     return subprocess.run(
         ["systemctl", *args], capture_output=True, text=True, check=False
+    )
+
+
+def _user_scope_unreachable_reason() -> str | None:
+    """Why this process cannot see the service account's user manager, or ``None``.
+
+    Decided from the process's own identity, never from a spawned command's
+    output: a root process whose ``SUDO_USER`` names a human is a ``sudo`` shell,
+    and ``systemctl --user`` from it would answer for root's (usually absent)
+    manager while the human's unit runs on unseen — the one answer worse than
+    "unreachable". ``service install`` is documented to run under sudo, so this is
+    the shell an operator is most likely to type ``service status`` into.
+
+    Every other failure to reach the user bus — no session, a stripped
+    environment, a sandbox — is left to ``systemctl`` itself, whose exit status
+    and diagnostic :func:`_unit_state` reports verbatim as "not reachable".
+    """
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is None or geteuid() != 0:
+        return None
+    account = _current_user()
+    if not account or account == "root":
+        return None
+    return (
+        f"this is a root shell, and the user scope belongs to {account}'s own "
+        f"session; run `systemctl --user status {SERVICE_NAME}.service` as {account}"
+    )
+
+
+@dataclass(frozen=True)
+class _UnitState:
+    """What one systemd scope says about ``kirocrew.service``.
+
+    ``load`` is systemd's ``LoadState`` (``loaded``, ``not-found``, ``masked``,
+    ...) or ``None`` when the scope could not be queried at all, in which case
+    ``error`` carries the reason. ``unit_id`` is the canonical ``Id`` the manager
+    resolved the name to — another unit's name when ours is an alias — and
+    ``fragment`` the unit file it loaded for THAT unit, which is why
+    :func:`uninstall` removes it only when :attr:`removable` holds.
+    """
+
+    scope: str
+    load: str | None
+    active: str = ""
+    sub: str = ""
+    fragment: str = ""
+    unit_id: str = ""
+    error: str = ""
+
+    @property
+    def reachable(self) -> bool:
+        return self.load is not None
+
+    @property
+    def installed(self) -> bool:
+        """The manager knows a unit by this name (any load state but not-found)."""
+        return self.load is not None and self.load != "not-found"
+
+    @property
+    def is_alias(self) -> bool:
+        """The name resolves to a different canonical unit."""
+        return bool(self.unit_id) and self.unit_id != f"{SERVICE_NAME}.service"
+
+    @property
+    def removable(self) -> bool:
+        """The unit file is ours to unlink: a LOADED unit whose canonical name is
+        ours and whose fragment is named after it. An alias resolves to another
+        unit's file, a mask to ``/dev/null``, and a unit file that failed to parse
+        is left for the operator — none of them is deleted on this name's account.
+        """
+        return (
+            self.load == "loaded"
+            and not self.is_alias
+            and os.path.basename(self.fragment) == f"{SERVICE_NAME}.service"
+        )
+
+    def headline(self) -> str:
+        """One line naming the scope and its state — never a bare ``inactive``
+        standing in for "no unit here"."""
+        if not self.reachable:
+            return f"{self.scope} scope: not reachable from this shell ({self.error})"
+        if not self.installed:
+            return f"{self.scope} scope: not installed"
+        alias = f", an alias of {self.unit_id}" if self.is_alias else ""
+        return f"{self.scope} scope: {self.active} ({self.sub}){alias}"
+
+
+_SHOW_PROPERTIES = ("Id", "LoadState", "ActiveState", "SubState", "FragmentPath")
+
+
+def _unit_state(*, user: bool) -> _UnitState:
+    """Query one scope for the unit's load / active state and unit file.
+
+    ``systemctl show`` rather than ``is-active`` or ``status`` because it is the
+    one query that separates "no unit in this scope" (``LoadState=not-found``)
+    from "a unit that is stopped" (``loaded`` + ``inactive``): ``is-active``
+    answers ``inactive`` to both, which is what turns a running user-scope
+    gateway into a dead system unit in a report that asks only one scope.
+    Properties are parsed as ``Key=value`` lines rather than read with
+    ``--value``, which the systemd 219 the module docstring commits to does not
+    have.
+
+    A scope is unreachable when ``systemctl`` exits non-zero without printing a
+    ``LoadState`` — no bus, no session, a sandbox — and the diagnostic is carried
+    as the reason; nothing here classifies stderr text.
+    """
+    scope = "user" if user else "system"
+    if user:
+        reason = _user_scope_unreachable_reason()
+        if reason is not None:
+            return _UnitState(scope, None, error=reason)
+    argv: list[str] = ["show"]
+    for prop in _SHOW_PROPERTIES:
+        argv += ["-p", prop]
+    res = _systemctl(*argv, f"{SERVICE_NAME}.service", sudo=False, user=user)
+    props: dict[str, str] = {}
+    for line in (res.stdout or "").splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            props[key.strip()] = value.strip()
+    load = props.get("LoadState")
+    if load is None:
+        detail = (res.stderr or res.stdout or "").strip().splitlines()
+        return _UnitState(
+            scope,
+            None,
+            error=detail[0] if detail else f"systemctl exited {res.returncode} without output",
+        )
+    return _UnitState(
+        scope,
+        load,
+        active=props.get("ActiveState", ""),
+        sub=props.get("SubState", ""),
+        fragment=props.get("FragmentPath", ""),
+        unit_id=props.get("Id", ""),
     )
 
 
@@ -582,7 +737,8 @@ def _user_scope_remedy() -> str:
         f"   Manage it with `systemctl --user status|restart {SERVICE_NAME}` and\n"
         f"   `journalctl --user -u {SERVICE_NAME} -f`. `kirocrew service "
         f"status|uninstall`\n"
-        f"   only looks at the system unit, so it will not see this one."
+        f"   report and remove it as the user scope — run them as {account}, not\n"
+        f"   under sudo, since a root shell cannot reach that account's manager."
     )
 
 
@@ -861,51 +1017,162 @@ def remove_launcher_profile() -> apparmor.ProfileOutcome:
     return apparmor.uninstall_launcher(_sudo_run_checked)
 
 
-def uninstall() -> None:
-    """Stop, disable, and remove the unit. Idempotent."""
+@dataclass(frozen=True)
+class UninstallReport:
+    """What :func:`uninstall` did, per scope, for the controller to print.
+
+    Each field is one of ``"removed (<unit file>)"``, ``"not installed"``,
+    ``"left in place (<why>)"`` or, for the user scope, ``"not reachable from this
+    shell (<reason>)"`` — so the operator always reads which scope was touched and
+    which was not, instead of a blanket "stopped and removed" that is true of one
+    scope at most. ``incomplete`` is set when a removal that was attempted did not
+    finish (the user unit's file could not be unlinked): the report still carries
+    every scope, and the controller exits non-zero after printing it. It is a
+    report rather than an exception because by then the other scope may already
+    be torn down, and an exception would drop that fact and skip the AppArmor
+    profile removal that follows.
+    """
+
+    system: str
+    user: str
+    incomplete: bool = False
+
+    @property
+    def removed_any(self) -> bool:
+        return self.system.startswith("removed") or self.user.startswith("removed")
+
+
+def uninstall() -> UninstallReport:
+    """Stop, disable, and remove the unit from every scope that has it. Idempotent.
+
+    The system scope is torn down under sudo as before. The user scope — the
+    unit the SELinux remedy stands up — is torn down through the account's own
+    manager (``systemctl --user``, never sudo) and its unit file is unlinked as
+    the calling user. A user scope this shell cannot reach is left alone and
+    reported as such: nothing is deleted on the strength of a query that did not
+    run. Nothing installed in either scope is a plain report, not an error.
+    """
     # Probe unprivileged so we don't prompt for a password when the unit isn't
     # even present: a stock `/etc/systemd/system` is traversable by every user,
     # so a plain stat answers this. Unlike `_seed_env_file`'s probe, this one
     # does not need the privileged `test -e` — that path targets a directory an
     # operator may have locked down, where an unprivileged stat cannot answer
     # trustworthily (see that function's own docstring for the failure it takes).
-    if not UNIT_PATH.exists():
-        return
-    _require_privilege()
-    _systemctl("stop", f"{SERVICE_NAME}.service")
-    _systemctl("disable", f"{SERVICE_NAME}.service")
-    _sudo_run("rm", "-f", str(UNIT_PATH))
-    # Remove the overrides file ONLY when it still holds our untouched seed —
-    # proving both that we wrote it and that the operator never edited it. An
-    # operator-authored or -edited /etc/kirocrew/kirocrew.env (including one
-    # pre-provisioned before install, which _seed_env_file preserves) is their
-    # config, not ours to delete. rmdir is best-effort and only clears an empty
-    # dir, so it never removes anything else parked under /etc/kirocrew.
-    if _env_file_is_untouched_seed():
-        _sudo_run("rm", "-f", str(ENV_FILE_PATH))
-        _sudo_run("rmdir", str(ENV_DIR))
-    _systemctl("daemon-reload")
+    system = "not installed"
+    if UNIT_PATH.exists():
+        _require_privilege()
+        _systemctl("stop", f"{SERVICE_NAME}.service")
+        _systemctl("disable", f"{SERVICE_NAME}.service")
+        _sudo_run("rm", "-f", str(UNIT_PATH))
+        # Remove the overrides file ONLY when it still holds our untouched seed —
+        # proving both that we wrote it and that the operator never edited it. An
+        # operator-authored or -edited /etc/kirocrew/kirocrew.env (including one
+        # pre-provisioned before install, which _seed_env_file preserves) is their
+        # config, not ours to delete. rmdir is best-effort and only clears an empty
+        # dir, so it never removes anything else parked under /etc/kirocrew.
+        if _env_file_is_untouched_seed():
+            _sudo_run("rm", "-f", str(ENV_FILE_PATH))
+            _sudo_run("rmdir", str(ENV_DIR))
+        _systemctl("daemon-reload")
+        system = f"removed ({UNIT_PATH})"
+
+    state = _unit_state(user=True)
+    if not state.reachable:
+        return UninstallReport(system, f"not reachable from this shell ({state.error})")
+    if not state.installed:
+        return UninstallReport(system, "not installed")
+    # `systemctl show <name>` answers for the unit the name RESOLVES to. For an
+    # alias that is another unit — its Id, its FragmentPath — and stopping,
+    # disabling or unlinking on our name's account would act on that unit; a
+    # mask points at /dev/null; a unit that failed to parse is the operator's to
+    # inspect. Only a loaded unit that is canonically ours, in a file named after
+    # it, is torn down. The system scope needs no such check: it removes the one
+    # literal path it installs.
+    if not state.removable:
+        if state.is_alias:
+            what = f"{SERVICE_NAME}.service is an alias of {state.unit_id}; manage that unit"
+        else:
+            what = f"load state {state.load}, unit file {state.fragment or 'unknown'}"
+        return UninstallReport(system, f"left in place ({what})")
+    _systemctl("stop", f"{SERVICE_NAME}.service", user=True)
+    _systemctl("disable", f"{SERVICE_NAME}.service", user=True)
+    # The file the manager actually loaded, as systemd reports it, rather than a
+    # path this module guesses: the remedy names one location, but a unit an
+    # operator placed elsewhere is just as much the user-scope unit.
+    try:
+        os.unlink(state.fragment)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        # Reported, not raised: the system scope above may already be gone, and
+        # the controller still has the AppArmor profile to remove and both scope
+        # lines to print. The unit is stopped and disabled, so nothing runs.
+        return UninstallReport(
+            system,
+            f"stopped and disabled, but its unit file {state.fragment} could not be "
+            f"removed ({exc}); remove it by hand, then run "
+            f"`systemctl --user daemon-reload`",
+            incomplete=True,
+        )
+    _systemctl("daemon-reload", user=True)
+    return UninstallReport(system, f"removed ({state.fragment})")
 
 
-def is_active() -> bool:
-    """Return True if the systemd service is currently active.
+def user_unit_installed() -> bool:
+    """Whether the calling account's own manager has a ``kirocrew.service`` loaded.
 
-    ``is-active`` does not require sudo to query state, so we use the
-    non-sudo path.
+    The one scope question a caller outside this module needs: ``kirocrew logs``
+    reads the USER journal when the gateway is the per-user unit, and that
+    journal exists only if this answers True. An unreachable user scope (root
+    shell, no session bus) is False — there is nothing to read from here.
     """
-    res = _systemctl("is-active", f"{SERVICE_NAME}.service", sudo=False)
+    return _unit_state(user=True).installed
+
+
+def user_unit_active() -> bool:
+    """Whether the per-user unit is running right now.
+
+    ``kirocrew logs`` asks this when BOTH scopes hold a unit — a stopped system
+    unit left by an earlier install beside the per-user one — so the journal it
+    shows is the running gateway's, not the dead unit's.
+    """
+    return _scope_is_active(user=True)
+
+
+def _scope_is_active(*, user: bool) -> bool:
+    """``systemctl [--user] is-active`` for one scope, without sudo."""
+    if user and _user_scope_unreachable_reason() is not None:
+        return False
+    res = _systemctl("is-active", f"{SERVICE_NAME}.service", sudo=False, user=user)
     return res.returncode == 0 and res.stdout.strip() == "active"
 
 
+def _active_scopes() -> list[bool]:
+    """The ``user`` flags of every scope currently running the unit."""
+    return [user for user in (False, True) if _scope_is_active(user=user)]
+
+
+def is_active() -> bool:
+    """Return True if the service is active in EITHER systemd scope.
+
+    ``is-active`` does not require sudo to query state, so both scopes use the
+    non-sudo path. The user scope counts because the SELinux remedy runs the
+    gateway there; a caller asking "is a managed gateway running?" must not be
+    told no while one is.
+    """
+    return bool(_active_scopes())
+
+
 def stop() -> None:
-    """Stop the running service without disabling it."""
-    _systemctl("stop", f"{SERVICE_NAME}.service")
+    """Stop the running service in every scope where it runs, without disabling it."""
+    for user in _active_scopes():
+        _systemctl("stop", f"{SERVICE_NAME}.service", user=user)
 
 
 def restart() -> bool:
-    """Atomically restart the service. Returns True iff systemctl succeeded.
+    """Atomically restart the service where it runs. True iff every restart succeeded.
 
-    Single ``systemctl restart`` call rather than ``stop`` + ``start`` —
+    Single ``systemctl restart`` call per scope rather than ``stop`` + ``start`` —
     smaller down-window, and the supervisor stays in charge of the
     lifecycle the whole time. ``Restart=always`` semantics in the
     unit are unaffected: ``systemctl restart`` is an explicit operator
@@ -914,19 +1181,46 @@ def restart() -> bool:
     A system-scope restart requires root/polkit; an unprivileged caller
     gets a non-zero exit ("Interactive authentication required"). We
     return that outcome so callers do not report a restart that never
-    happened.
+    happened. A unit running in no scope at all is likewise False: nothing was
+    restarted.
     """
-    return _systemctl("restart", f"{SERVICE_NAME}.service").returncode == 0
+    scopes = _active_scopes()
+    if not scopes:
+        return False
+    # Every scope gets its restart before the results are combined: a lazy
+    # `all()` over a generator would stop at the first refusal and leave the
+    # other scope's gateway untouched while reporting a failed restart.
+    results = [
+        _systemctl("restart", f"{SERVICE_NAME}.service", user=user).returncode == 0
+        for user in scopes
+    ]
+    return all(results)
 
 
 def status() -> str:
-    """Return a human-readable status block from systemctl.
+    """Return a human-readable status report covering BOTH systemd scopes.
+
+    One headline per scope — ``system scope: …`` then ``user scope: …`` — stating
+    ``not installed``, ``not reachable from this shell (…)``, or the unit's
+    ``ActiveState (SubState)``, followed by the ``systemctl status`` block for
+    each scope that actually has a unit. A scope with no unit never shows
+    systemd's ``inactive (dead)`` for it: that line, printed for the system
+    scope alone, is what makes a running user-scope gateway read as dead.
 
     Status is queryable without sudo. We avoid sudo here so
     ``kirocrew service status`` doesn't prompt for a password just to
     show whether the service is up.
     """
-    res = _systemctl(
-        "status", f"{SERVICE_NAME}.service", "--no-pager", sudo=False
-    )
-    return res.stdout or res.stderr
+    sections: list[str] = []
+    for user in (False, True):
+        state = _unit_state(user=user)
+        lines = [state.headline()]
+        if state.installed:
+            res = _systemctl(
+                "status", f"{SERVICE_NAME}.service", "--no-pager", sudo=False, user=user
+            )
+            block = (res.stdout or res.stderr).rstrip("\n")
+            if block:
+                lines.append(block)
+        sections.append("\n".join(lines))
+    return "\n\n".join(sections)

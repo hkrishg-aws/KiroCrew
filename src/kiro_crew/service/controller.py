@@ -161,17 +161,27 @@ def uninstall_service() -> int:
         # non-zero with the reason rather than letting a traceback escape (and
         # leaving the service installed).
         try:
-            linux.uninstall()
+            report = linux.uninstall()
             # Whatever removes the service removes the grant, so a host is left
             # as it was found rather than carrying an orphaned userns permission.
             profile = linux.remove_apparmor_profile()
         except linux.ServiceInstallError as exc:
             print(f"❌ {exc}", file=sys.stderr)
             return 1
-        print("✅ kirocrew service stopped and removed.")
+        # Both scopes are always named: a unit can live in the system scope, in
+        # the account's user scope (the SELinux remedy), or in neither, and the
+        # operator must read which one this actually touched. An incomplete
+        # removal still prints everything (and still drops the profile above);
+        # only the exit code says it needs a hand.
+        if report.removed_any:
+            print("✅ kirocrew service stopped and removed.")
+        else:
+            print("ℹ️  No kirocrew service was removed.")
+        print(f"   system scope: {report.system}")
+        print(f"   {'⚠️ ' if report.incomplete else ''}user scope: {report.user}")
         if profile.message:
             print(f"   {'' if profile.ok else '⚠️ '}{profile.message}")
-        return 0
+        return 1 if report.incomplete else 0
     if plat == Platform.LAUNCHD:
         macos.uninstall()
         print("✅ kirocrew service stopped and removed.")
